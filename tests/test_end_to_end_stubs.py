@@ -63,6 +63,8 @@ def stubbed(tmp_path, monkeypatch, jobs):
         node_ip="203.0.113.10",
         omcsi_dir=str(tmp_path / "omcsi"),
         backup_dir=str(tmp_path / "backups"),
+        service_account_namespace="platform",
+        service_account_name="api-sa",
     )
     http_calls = []
 
@@ -74,7 +76,12 @@ def stubbed(tmp_path, monkeypatch, jobs):
     app = create_app(
         settings,
         db=Database(settings.db_path),
-        cluster=KubectlHelmBackend(settings.omcsi_dir, settings.backup_dir, http=wrapper_http),
+        cluster=KubectlHelmBackend(
+            settings.omcsi_dir,
+            settings.backup_dir,
+            service_account=(settings.service_account_namespace, settings.service_account_name),
+            http=wrapper_http,
+        ),
         validator=FakeValidator({"t": "alice"}),
         uuids=FakeResolver(),
         jobs=jobs,
@@ -100,8 +107,9 @@ def test_create_get_and_delete_through_real_subprocesses(stubbed):
     tools = [os.path.basename(c["argv"][0]) + " " + " ".join(c["argv"][1:3]) for c in seen]
     assert tools == [
         "kubectl get namespace",
-        "kubectl apply -f",
-        "kubectl apply -f",
+        "kubectl apply -f",  # namespace, quota, limit range
+        "kubectl apply -f",  # the tenant RoleBinding: first thing inside the namespace
+        "kubectl apply -f",  # the credentials Secret
         "kubectl -n t-alpha",  # statefulset read before install (not found: fresh)
         "helm upgrade --install",
         "kubectl -n t-alpha",  # scale
@@ -110,12 +118,19 @@ def test_create_get_and_delete_through_real_subprocesses(stubbed):
         "kubectl -n t-alpha",  # rollout status nginx
     ]
     assert json.loads(seen[1]["stdin"])["kind"] == "List"
-    assert json.loads(seen[2]["stdin"])["metadata"]["name"] == "dsh-credentials"
-    helm = seen[4]["argv"]
+    binding = json.loads(seen[2]["stdin"])
+    assert binding["kind"] == "RoleBinding"
+    assert binding["metadata"] == {"name": "dsh-api", "namespace": "t-alpha"}
+    assert binding["roleRef"]["name"] == "dsh-api-tenant"
+    assert binding["subjects"] == [
+        {"kind": "ServiceAccount", "name": "api-sa", "namespace": "platform"}
+    ]
+    assert json.loads(seen[3]["stdin"])["metadata"]["name"] == "dsh-credentials"
+    helm = seen[5]["argv"]
     assert "--set" in helm and "minecraftWrapper.env.SERVER_MOTD=hey" in helm
     assert "--wait" not in helm and "minecraftWrapper.replicas=1" not in helm
-    assert "scale" in seen[5]["argv"]
-    assert [c["argv"][5] for c in seen[6:9]] == [
+    assert "scale" in seen[6]["argv"]
+    assert [c["argv"][5] for c in seen[7:10]] == [
         "statefulset/alpha-omcsi-minecraft-wrapper",
         "deployment/alpha-omcsi-webapp",
         "deployment/alpha-omcsi-nginx",

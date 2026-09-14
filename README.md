@@ -14,9 +14,11 @@ what remains (see the MVP done-when list).
   token's `sub` is the tenant id.
 - Provisioning shells out to `kubectl` and `helm` exactly the way the
   operator's script does: namespace `t-<name>` with the hosted-free quota and
-  limit range, a `dsh-credentials` Secret, then `helm upgrade --install` of the
-  OMCSI chart from its co-located values profile. The chart is baked into the
-  image at a pinned commit (`OMCSI_PIN` build arg).
+  limit range, a RoleBinding giving the API itself access to that namespace
+  (see [Permission model](#permission-model)), a `dsh-credentials` Secret,
+  then `helm upgrade --install` of the OMCSI chart from its co-located values
+  profile. The chart is baked into the image at a pinned commit (`OMCSI_PIN`
+  build arg).
 - Every cluster interaction goes through one interface, `ClusterBackend`
   (`src/dsh_api/cluster.py`), with a real `KubectlHelmBackend` and a
   `FakeClusterBackend` used by the tests. Nothing in the test suite needs a
@@ -128,6 +130,8 @@ OMCSI checkout at `OMCSI_CHART_DIR` (the image provides all three).
 | `OMCSI_CHART_DIR` | `/opt/omcsi` | OMCSI checkout; the chart is `helm/omcsi` inside it |
 | `DSH_BACKUP_DIR` | `/backups` | where `DELETE` writes `<name>-<timestamp>.tar.gz` |
 | `DSH_ROLLOUT_TIMEOUT` | `5m` | per-object `kubectl rollout status` timeout after install |
+| `DSH_SERVICE_ACCOUNT_NAMESPACE` | `dsh-api` | where the API's ServiceAccount lives; the Deployment sets it from the pod's own namespace |
+| `DSH_SERVICE_ACCOUNT_NAME` | `dsh-api` | the ServiceAccount the per-tenant RoleBinding is made out to; the Deployment sets it from `spec.serviceAccountName` |
 | `DSH_MAX_SERVERS_PER_TENANT` | `1` | the cap behind the 403 |
 | `DSH_ADMIN_USERS` | `dmccoystephenson` | comma-separated JWT `sub`s that may read and triage feedback |
 | `DSH_DEFAULT_PLUGINS` | Dan's Plugin Manager `0.7.0-SNAPSHOT-8-8-2026` release jar | comma-separated plugin download URLs every new server is installed with; empty for none |
@@ -147,12 +151,43 @@ same numbers the cluster enforces.
 ## Deploying
 
 `deploy/` holds plain manifests (`kubectl kustomize deploy/` renders them):
-namespace, ServiceAccount + ClusterRole limited to what provisioning touches,
-ConfigMap, Secret stub, two PVCs (state, backups), Deployment, Service and the
-`api.<domain>` Ingress with the cert-manager annotation. Before applying: build
-and push the image somewhere the cluster can pull from and set it in
-`deployment.yaml`, put the real node address in `config.yaml`, and create the
-`dsh-api` Secret out of band rather than from the committed stub.
+namespace, ServiceAccount + the two ClusterRoles below, ConfigMap, Secret
+stub, two PVCs (state, backups), Deployment, Service and the `api.<domain>`
+Ingress with the cert-manager annotation. Before applying: build and push the
+image somewhere the cluster can pull from and set it in `deployment.yaml`,
+put the real node address in `config.yaml`, and create the `dsh-api` Secret
+out of band rather than from the committed stub.
+
+### Permission model
+
+The API never holds a kubeconfig; it acts as the `dsh-api` ServiceAccount
+with the token Kubernetes mounts into the pod. Tenant namespaces are created
+at request time, so a namespaced Role cannot be bound to them in advance —
+but that is no reason to hold the namespaced verbs everywhere. The grant is
+split in two (`deploy/rbac.yaml`):
+
+| ClusterRole | Bound | Holds |
+|---|---|---|
+| `dsh-api-cluster` | cluster-wide, by a ClusterRoleBinding | only what has to work before a tenant namespace has a binding: `namespaces` (get/list/create/patch/delete); `resourcequotas` and `limitranges` (create/get/patch/delete — namespaced, but applied in the same step as the namespace); `rolebindings` (create/get/patch); and the `bind` verb on **one** ClusterRole, `dsh-api-tenant`, by `resourceNames` |
+| `dsh-api-tenant` | per tenant, by a RoleBinding the API creates in `t-<name>` | the namespaced rules helm and the backend actually use: secrets, configmaps, services, serviceaccounts, persistentvolumeclaims, pods, `pods/exec`, `pods/attach`, `pods/log`, events, deployments, statefulsets, `statefulsets/scale`, horizontalpodautoscalers, ingresses, networkpolicies |
+
+Creating a server therefore goes: namespace + quota + limit range (cluster
+role), then the RoleBinding `dsh-api` in the new namespace binding
+`dsh-api-tenant` to the API's ServiceAccount, and only then the Secret, helm,
+the scale and the rollout waits — every one of which is allowed by that
+binding alone. Deleting the namespace deletes the binding with it. The
+result is that a compromise of the API pod reaches the tenant namespaces it
+has bound and nothing else: not `dsh-api`'s own Secret, not `kube-system`,
+not another platform namespace. Creating a binding to a ClusterRole one does
+not already hold every permission of needs `bind` on that role, which is why
+`dsh-api-cluster` carries it, restricted to `dsh-api-tenant`; `escalate` is
+not granted, so the API cannot write Roles or ClusterRoles at all.
+
+The ServiceAccount the binding is made out to comes from
+`DSH_SERVICE_ACCOUNT_NAMESPACE` / `DSH_SERVICE_ACCOUNT_NAME`, which the
+Deployment fills from the pod's own namespace and `serviceAccountName`, so
+renaming either in the manifests cannot leave the binding pointing at the
+wrong subject.
 
 ## Layout
 

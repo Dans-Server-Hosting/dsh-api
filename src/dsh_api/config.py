@@ -62,6 +62,10 @@ class Settings:
     omcsi_dir: str = "/opt/omcsi"
     backup_dir: str = "/backups"
     rollout_timeout: str = "5m"
+    service_account_namespace: str = "dsh-api"
+    service_account_name: str = "dsh-api"
+    """The ServiceAccount the API runs as; each tenant namespace gets a
+    RoleBinding granting it the dsh-api-tenant ClusterRole there."""
     max_servers_per_tenant: int = 1
     admin_users: frozenset[str] = frozenset(split_csv(DEFAULT_ADMIN_USERS))
     default_plugins: tuple[str, ...] = split_csv(DEFAULT_PLUGINS)
@@ -78,6 +82,10 @@ class Settings:
             omcsi_dir=env.get("OMCSI_CHART_DIR", cls.omcsi_dir),
             backup_dir=env.get("DSH_BACKUP_DIR", cls.backup_dir),
             rollout_timeout=env.get("DSH_ROLLOUT_TIMEOUT", cls.rollout_timeout),
+            service_account_namespace=env.get(
+                "DSH_SERVICE_ACCOUNT_NAMESPACE", cls.service_account_namespace
+            ),
+            service_account_name=env.get("DSH_SERVICE_ACCOUNT_NAME", cls.service_account_name),
             max_servers_per_tenant=int(
                 env.get("DSH_MAX_SERVERS_PER_TENANT", cls.max_servers_per_tenant)
             ),

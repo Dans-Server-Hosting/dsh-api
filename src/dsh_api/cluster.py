@@ -19,6 +19,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
+TENANT_CLUSTER_ROLE = "dsh-api-tenant"
+"""The ClusterRole with the namespaced rules (deploy/rbac.yaml), bound into
+each tenant namespace by a RoleBinding the API creates."""
+TENANT_ROLE_BINDING = "dsh-api"
 WRAPPER_PVC_SUFFIX = "-omcsi-mcserver"
 WRAPPER_STS_SUFFIX = "-omcsi-minecraft-wrapper"
 WRAPPER_COMPONENT_LABEL = "app.kubernetes.io/component=minecraft-wrapper"
@@ -118,6 +122,11 @@ class ClusterBackend(Protocol):
 
     def create_tenant_namespace(self, name: str) -> None:
         """Namespace ``t-<name>`` with its labels, ResourceQuota and LimitRange."""
+
+    def grant_tenant_access(self, name: str) -> None:
+        """RoleBinding in ``t-<name>`` giving the API's ServiceAccount the
+        ``dsh-api-tenant`` ClusterRole there. Everything namespaced that follows
+        (the Secret, helm, scale, exec) is allowed by this binding alone."""
 
     def create_credentials(self, name: str, creds: Credentials) -> None:
         """Secret ``dsh-credentials`` in the tenant namespace."""
@@ -231,6 +240,21 @@ def tenant_namespace_manifests(name: str) -> dict:
                 },
             },
         ],
+    }
+
+
+def tenant_rolebinding_manifest(name: str, sa_namespace: str, sa_name: str) -> dict:
+    """The binding that scopes the API's namespaced permissions to this tenant."""
+    return {
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "RoleBinding",
+        "metadata": {"name": TENANT_ROLE_BINDING, "namespace": namespace_for(name)},
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": TENANT_CLUSTER_ROLE,
+        },
+        "subjects": [{"kind": "ServiceAccount", "name": sa_name, "namespace": sa_namespace}],
     }
 
 
@@ -368,12 +392,15 @@ class KubectlHelmBackend:
         omcsi_dir: str,
         backup_dir: str,
         rollout_timeout: str = "5m",
+        service_account: tuple[str, str] = ("dsh-api", "dsh-api"),
         run=run_command,
         http=http_json,
     ) -> None:
         self.omcsi_dir = omcsi_dir
         self.backup_dir = Path(backup_dir)
         self.rollout_timeout = rollout_timeout
+        self.service_account = service_account
+        """``(namespace, name)`` of the ServiceAccount the API runs as."""
         self._run = run
         self._http = http
 
@@ -390,6 +417,11 @@ class KubectlHelmBackend:
         self._run(
             ["kubectl", "apply", "-f", "-"], stdin=json.dumps(tenant_namespace_manifests(name))
         )
+
+    def grant_tenant_access(self, name: str) -> None:
+        sa_namespace, sa_name = self.service_account
+        manifest = tenant_rolebinding_manifest(name, sa_namespace, sa_name)
+        self._run(["kubectl", "apply", "-f", "-"], stdin=json.dumps(manifest))
 
     def create_credentials(self, name: str, creds: Credentials) -> None:
         secret = {
@@ -580,6 +612,8 @@ class FakeClusterBackend:
 
     backup_dir: Path
     namespaces: set[str] = field(default_factory=set)
+    bound: set[str] = field(default_factory=set)
+    """Namespaces holding the tenant RoleBinding; namespaced steps need it."""
     credentials: dict[str, Credentials] = field(default_factory=dict)
     releases: dict[str, ReleaseSpec] = field(default_factory=dict)
     wrappers: dict[str, StatefulSetStatus] = field(default_factory=dict)
@@ -601,14 +635,27 @@ class FakeClusterBackend:
         self._op("create_tenant_namespace", name)
         self.namespaces.add(namespace_for(name))
 
+    def grant_tenant_access(self, name: str) -> None:
+        self._op("grant_tenant_access", name)
+        if namespace_for(name) not in self.namespaces:
+            raise ClusterError(f"namespaces {namespace_for(name)!r} not found")
+        self.bound.add(namespace_for(name))
+
+    def _require_binding(self, name: str) -> None:
+        # What the real cluster would answer without the RoleBinding.
+        if namespace_for(name) not in self.bound:
+            raise ClusterError(f"forbidden: no access to namespace {namespace_for(name)}")
+
     def create_credentials(self, name: str, creds: Credentials) -> None:
         self._op("create_credentials", name)
+        self._require_binding(name)
         self.credentials[name] = creds
 
     def install_release(self, spec: ReleaseSpec, creds: Credentials) -> None:
         current = self.wrappers.get(spec.name, StatefulSetStatus(exists=False))
         keep_awake = current.exists and current.replicas >= 1
         self._op("install_release", spec.name, keep_awake)
+        self._require_binding(spec.name)
         self.releases[spec.name] = spec
         self.wrappers[spec.name] = StatefulSetStatus(exists=True, replicas=1 if keep_awake else 0)
 
@@ -670,6 +717,7 @@ class FakeClusterBackend:
     def delete_namespace(self, name: str) -> None:
         self._op("delete_namespace", name)
         self.namespaces.discard(namespace_for(name))
+        self.bound.discard(namespace_for(name))  # the binding goes with its namespace
         self.credentials.pop(name, None)
 
     # --- test helpers ------------------------------------------------------

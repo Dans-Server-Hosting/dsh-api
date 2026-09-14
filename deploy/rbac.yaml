@@ -1,11 +1,21 @@
 # The API never holds a kubeconfig: it acts as this ServiceAccount, with the
-# in-cluster token Kubernetes mounts. The grant is a ClusterRole because tenant
-# namespaces are created at request time (a namespaced Role cannot cover a
-# namespace that does not exist yet) and because namespaces themselves are
-# cluster-scoped. The rules are exactly what provisioning needs: namespaces,
-# the hosted-free quota and limit range, the credentials Secret, the object
-# kinds the OMCSI chart contains, the wrapper's scale subresource, and exec
-# into the wrapper pod for backups.
+# in-cluster token Kubernetes mounts.
+#
+# Two ClusterRoles, bound differently:
+#
+# - dsh-api-cluster is bound cluster-wide (ClusterRoleBinding) and holds only
+#   what has to work before a tenant namespace exists or applies to no
+#   namespace at all: namespaces themselves; the hosted-free ResourceQuota and
+#   LimitRange (namespaced objects, but created in the same apply as the
+#   namespace, before any binding inside it exists); and the right to create
+#   the per-tenant RoleBinding — which needs the ``bind`` verb on the one
+#   ClusterRole it may reference.
+# - dsh-api-tenant holds the namespaced rules (the Secret, what the OMCSI chart
+#   renders, the wrapper's scale subresource, exec into the wrapper pod for
+#   backups). It is bound by a RoleBinding that the API creates in each
+#   t-<name> namespace right after the namespace itself, so these verbs work
+#   only where a binding exists: never in dsh-api, kube-system or another
+#   platform namespace.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -15,21 +25,42 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: dsh-api-provisioner
+  name: dsh-api-cluster
 rules:
   - apiGroups: [""]
     resources: [namespaces]
     verbs: [get, list, create, patch, delete]
+  # Namespaced, but applied together with the namespace, before the tenant
+  # RoleBinding exists; ``kubectl apply`` needs get for its diff and patch for a
+  # re-run over an existing object.
   - apiGroups: [""]
     resources: [resourcequotas, limitranges]
-    verbs: [get, list, create, patch, update, delete]
-  # Helm stores release state in Secrets; the chart also renders one.
+    verbs: [create, get, patch, delete]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [rolebindings]
+    verbs: [create, get, patch]
+  # Creating a RoleBinding to a ClusterRole one does not already hold every
+  # permission of requires ``bind`` on that ClusterRole — and only that one.
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [clusterroles]
+    resourceNames: [dsh-api-tenant]
+    verbs: [bind]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dsh-api-tenant
+rules:
+  # Helm stores release state in Secrets; the chart also renders one, and the
+  # API writes dsh-credentials.
   - apiGroups: [""]
     resources: [secrets, configmaps, services, serviceaccounts, persistentvolumeclaims]
     verbs: [get, list, watch, create, patch, update, delete]
   - apiGroups: [""]
     resources: [pods]
     verbs: [get, list, watch, create, delete]
+  # exec for the backup of an awake server; attach for the throwaway reader
+  # pod (``kubectl run -i --rm``) that backs up an asleep one.
   - apiGroups: [""]
     resources: [pods/exec, pods/attach]
     verbs: [create]
@@ -48,18 +79,15 @@ rules:
   - apiGroups: [networking.k8s.io]
     resources: [ingresses, networkpolicies]
     verbs: [get, list, watch, create, patch, update, delete]
-  - apiGroups: [policy]
-    resources: [poddisruptionbudgets]
-    verbs: [get, list, watch, create, patch, update, delete]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: dsh-api-provisioner
+  name: dsh-api-cluster
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: dsh-api-provisioner
+  name: dsh-api-cluster
 subjects:
   - kind: ServiceAccount
     name: dsh-api

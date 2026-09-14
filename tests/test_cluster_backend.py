@@ -24,6 +24,7 @@ from dsh_api.cluster import (
     http_json,
     server_list_ping,
     tenant_namespace_manifests,
+    tenant_rolebinding_manifest,
     wrapper_api_url,
 )
 
@@ -181,14 +182,43 @@ def test_tenant_namespace_manifests_are_the_hosted_free_profile():
     ]
 
 
-def test_namespace_and_credentials_are_applied_over_stdin(backend):
-    be, runner = backend
+def test_tenant_rolebinding_binds_the_tenant_clusterrole_to_the_api():
+    binding = tenant_rolebinding_manifest("alpha", "dsh-api", "dsh-api")
+    assert binding == {
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "RoleBinding",
+        "metadata": {"name": "dsh-api", "namespace": "t-alpha"},
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": "dsh-api-tenant",
+        },
+        "subjects": [{"kind": "ServiceAccount", "name": "dsh-api", "namespace": "dsh-api"}],
+    }
+    # The ClusterRole name is the one deploy/rbac.yaml grants ``bind`` on.
+    rbac = (Path(__file__).parent.parent / "deploy" / "rbac.yaml").read_text()
+    assert "resourceNames: [dsh-api-tenant]" in rbac
+    assert "name: dsh-api-tenant" in rbac
+
+
+def test_namespace_binding_and_credentials_are_applied_over_stdin(tmp_path):
+    runner = Runner()
+    be = KubectlHelmBackend(
+        "/opt/omcsi", str(tmp_path), service_account=("platform", "api-sa"), run=runner
+    )
     be.create_tenant_namespace("alpha")
+    be.grant_tenant_access("alpha")
     be.create_credentials("alpha", CREDS)
-    (argv1, stdin1, _), (argv2, stdin2, _) = runner.calls
-    assert argv1 == argv2 == ["kubectl", "apply", "-f", "-"]
+    (argv1, stdin1, _), (argv2, stdin2, _), (argv3, stdin3, _) = runner.calls
+    assert argv1 == argv2 == argv3 == ["kubectl", "apply", "-f", "-"]
     assert json.loads(stdin1)["kind"] == "List"
-    secret = json.loads(stdin2)
+    binding = json.loads(stdin2)
+    assert binding["kind"] == "RoleBinding"
+    assert binding["metadata"]["namespace"] == "t-alpha"
+    assert binding["subjects"] == [
+        {"kind": "ServiceAccount", "name": "api-sa", "namespace": "platform"}
+    ]
+    secret = json.loads(stdin3)
     assert secret["kind"] == "Secret"
     assert secret["metadata"] == {"name": "dsh-credentials", "namespace": "t-alpha"}
     assert secret["stringData"] == {
