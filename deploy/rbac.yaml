@@ -1,0 +1,66 @@
+# The API never holds a kubeconfig: it acts as this ServiceAccount, with the
+# in-cluster token Kubernetes mounts. The grant is a ClusterRole because tenant
+# namespaces are created at request time (a namespaced Role cannot cover a
+# namespace that does not exist yet) and because namespaces themselves are
+# cluster-scoped. The rules are exactly what provisioning needs: namespaces,
+# the hosted-free quota and limit range, the credentials Secret, the object
+# kinds the OMCSI chart contains, the wrapper's scale subresource, and exec
+# into the wrapper pod for backups.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dsh-api
+  namespace: dsh-api
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dsh-api-provisioner
+rules:
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list, create, patch, delete]
+  - apiGroups: [""]
+    resources: [resourcequotas, limitranges]
+    verbs: [get, list, create, patch, update, delete]
+  # Helm stores release state in Secrets; the chart also renders one.
+  - apiGroups: [""]
+    resources: [secrets, configmaps, services, serviceaccounts, persistentvolumeclaims]
+    verbs: [get, list, watch, create, patch, update, delete]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch, create, delete]
+  - apiGroups: [""]
+    resources: [pods/exec, pods/attach]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [pods/log, events]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets]
+    verbs: [get, list, watch, create, patch, update, delete]
+  - apiGroups: [apps]
+    resources: [statefulsets/scale]
+    verbs: [get, patch, update]
+  - apiGroups: [autoscaling]
+    resources: [horizontalpodautoscalers]
+    verbs: [get, list, watch, create, patch, update, delete]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses, networkpolicies]
+    verbs: [get, list, watch, create, patch, update, delete]
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [get, list, watch, create, patch, update, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dsh-api-provisioner
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: dsh-api-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: dsh-api
+    namespace: dsh-api
