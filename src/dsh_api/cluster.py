@@ -56,6 +56,7 @@ class ReleaseSpec:
     motd: str
     operator_name: str | None = None
     operator_uuid: str | None = None
+    default_plugins: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -212,6 +213,10 @@ def helm_install_argv(
         "--set", f"webapp.env.MC_MOTD={spec.motd}",
         "--set", f"webapp.env.DASHBOARD_TITLE={spec.name}",
     ]  # fmt: skip
+    if spec.default_plugins:
+        # A bare comma is a list separator to ``helm --set``; the wrapper wants one string.
+        plugins = "\\,".join(spec.default_plugins)
+        argv += ["--set", f"minecraftWrapper.env.DEFAULT_PLUGINS={plugins}"]
     if spec.operator_name:
         argv += ["--set", f"minecraftWrapper.env.OPERATOR_NAME={spec.operator_name}"]
     if spec.operator_uuid:

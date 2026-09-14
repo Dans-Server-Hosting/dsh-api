@@ -1,4 +1,4 @@
-from dsh_api.config import Limits, Settings
+from dsh_api.config import DEFAULT_PLUGINS, Limits, Settings
 
 
 def test_healthz(client):
@@ -48,3 +48,23 @@ def test_settings_from_env():
     assert s.sslip_hostname("alpha") == "alpha.203-0-113-10.sslip.io"
     assert s.max_servers_per_tenant == 2
     assert s.jwt_secret == "s"
+
+
+def test_settings_defaults_for_admins_and_plugins():
+    s = Settings.from_env({"USERAUTH_JWT_SECRET": "s"})
+    assert s.admin_users == frozenset({"dmccoystephenson"})
+    assert s.is_admin("dmccoystephenson") and not s.is_admin("alice")
+    assert s.default_plugins == (DEFAULT_PLUGINS,)
+    assert DEFAULT_PLUGINS.startswith("https://github.com/Dans-Plugins/Dans-Plugin-Manager/")
+
+
+def test_settings_split_comma_separated_lists():
+    s = Settings.from_env(
+        {
+            "DSH_ADMIN_USERS": "alice, bob,",
+            "DSH_DEFAULT_PLUGINS": "https://a/x.jar,https://b/y.jar",
+        }
+    )
+    assert s.admin_users == frozenset({"alice", "bob"})
+    assert s.default_plugins == ("https://a/x.jar", "https://b/y.jar")
+    assert Settings.from_env({"DSH_DEFAULT_PLUGINS": ""}).default_plugins == ()

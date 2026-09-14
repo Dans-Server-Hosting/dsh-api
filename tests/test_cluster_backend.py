@@ -34,6 +34,7 @@ SPEC = ReleaseSpec(
     motd="hi there",
     operator_name="Steve",
     operator_uuid="8667ba71-b85a-4004-af54-457a9734eed7",
+    default_plugins=("https://example.com/dpm.jar",),
 )
 
 
@@ -78,6 +79,7 @@ def test_helm_install_line_matches_the_operator_script():
         "--set", "minecraftWrapper.env.SERVER_MOTD=hi there",
         "--set", "webapp.env.MC_MOTD=hi there",
         "--set", "webapp.env.DASHBOARD_TITLE=alpha",
+        "--set", "minecraftWrapper.env.DEFAULT_PLUGINS=https://example.com/dpm.jar",
         "--set", "minecraftWrapper.env.OPERATOR_NAME=Steve",
         "--set", "minecraftWrapper.env.OPERATOR_UUID=8667ba71-b85a-4004-af54-457a9734eed7",
         "--set", "secrets.rconPassword=rcon-x",
@@ -125,6 +127,23 @@ def test_helm_install_without_operator_omits_operator_flags():
     spec = ReleaseSpec(name="a", hostname="h", sslip_hostname="s", motd="m")
     argv = helm_install_argv(spec, CREDS, "/opt/omcsi")
     assert not any("OPERATOR" in a for a in argv)
+
+
+def test_helm_install_without_default_plugins_omits_the_flag():
+    spec = ReleaseSpec(name="a", hostname="h", sslip_hostname="s", motd="m")
+    argv = helm_install_argv(spec, CREDS, "/opt/omcsi")
+    assert not any("DEFAULT_PLUGINS" in a for a in argv)
+
+
+def test_helm_install_escapes_commas_between_default_plugins():
+    # ``helm --set`` splits a bare comma into a list; the wrapper wants one string.
+    spec = ReleaseSpec(
+        name="a", hostname="h", sslip_hostname="s", motd="m",
+        default_plugins=("https://a/x.jar", "https://b/y.jar"),
+    )  # fmt: skip
+    argv = helm_install_argv(spec, CREDS, "/opt/omcsi")
+    i = argv.index("minecraftWrapper.env.DEFAULT_PLUGINS=https://a/x.jar\\,https://b/y.jar")
+    assert argv[i - 1] == "--set"
 
 
 def test_tenant_namespace_manifests_are_the_hosted_free_profile():
