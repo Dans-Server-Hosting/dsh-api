@@ -120,10 +120,12 @@ class ServerService:
         try:
             self.cluster.create_tenant_namespace(name)
             self.cluster.create_credentials(name, creds)
+            # The profile installs the wrapper asleep and the webapp waits for
+            # it, so the release is installed without waiting, the wrapper is
+            # woken once, and only then are the rollouts waited for.
             self.cluster.install_release(spec, creds)
-            # The OMCSI webapp cannot start while the wrapper is asleep, so a
-            # freshly installed server is woken once (upstream limitation).
             self.cluster.scale_wrapper(name, 1)
+            self.cluster.wait_for_rollout(name)
         except ClusterError as exc:
             self.db.record(tenant_id, name, "create.failed", str(exc))
             raise

@@ -40,8 +40,11 @@ what remains (see the MVP done-when list).
 | `POST` | `/api/v1/servers/{name}/wake` | scales the wrapper to 1 |
 | `DELETE` | `/api/v1/servers/{name}` | backup, `helm uninstall`, namespace delete; 409 while players are online unless `?force=true` |
 
-`POST /api/v1/servers` blocks until the Helm release is installed
-(`helm --wait`, up to `DSH_HELM_TIMEOUT`), so expect it to take a few minutes.
+`POST /api/v1/servers` installs the release without waiting (the profile
+installs the wrapper asleep and the webapp's init container waits for it, so
+`helm --wait` could never finish), wakes the wrapper once, then waits for the
+wrapper, webapp and nginx rollouts (up to `DSH_ROLLOUT_TIMEOUT` each). Expect
+the call to take a few minutes.
 
 ## Running locally
 
@@ -68,7 +71,7 @@ OMCSI checkout at `OMCSI_CHART_DIR` (the image provides all three).
 | `DSH_NODE_IP` | *(required)* | node address for the `<name>.<ip-dashed>.sslip.io` fallback hostname |
 | `OMCSI_CHART_DIR` | `/opt/omcsi` | OMCSI checkout; the chart is `helm/omcsi` inside it |
 | `DSH_BACKUP_DIR` | `/backups` | where `DELETE` writes `<name>-<timestamp>.tar.gz` |
-| `DSH_HELM_TIMEOUT` | `5m` | `helm --wait` timeout |
+| `DSH_ROLLOUT_TIMEOUT` | `5m` | per-object `kubectl rollout status` timeout after install |
 | `DSH_MAX_SERVERS_PER_TENANT` | `1` | the cap behind the 403 |
 | `DSH_LIMIT_HEAP_GB` | `3` | free-tier profile served by `GET /api/v1/limits` |
 | `DSH_LIMIT_MEMORY_LIMIT_GIB` | `3.5` | " |

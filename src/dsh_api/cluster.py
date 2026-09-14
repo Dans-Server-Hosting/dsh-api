@@ -83,9 +83,15 @@ class ClusterBackend(Protocol):
     def create_credentials(self, name: str, creds: Credentials) -> None:
         """Secret ``dsh-credentials`` in the tenant namespace."""
 
-    def install_release(self, spec: ReleaseSpec, creds: Credentials) -> None: ...
+    def install_release(self, spec: ReleaseSpec, creds: Credentials) -> None:
+        """``helm upgrade --install`` without waiting: the webapp's init container
+        blocks until the wrapper is healthy, and the profile installs the wrapper
+        asleep, so a wait here could never finish."""
 
     def scale_wrapper(self, name: str, replicas: int) -> None: ...
+
+    def wait_for_rollout(self, name: str) -> None:
+        """Block until the wrapper StatefulSet, webapp and nginx have rolled out."""
 
     def wrapper_status(self, name: str) -> WrapperStatus: ...
 
@@ -182,9 +188,13 @@ def tenant_namespace_manifests(name: str) -> dict:
 
 
 def helm_install_argv(
-    spec: ReleaseSpec, creds: Credentials, omcsi_dir: str, timeout: str
+    spec: ReleaseSpec, creds: Credentials, omcsi_dir: str, keep_awake: bool = False
 ) -> list[str]:
-    """The operator's ``helm upgrade --install`` line, reproduced argument for argument."""
+    """The operator's ``helm upgrade --install`` line, reproduced argument for argument.
+
+    ``keep_awake`` is set on a re-run for a wrapper that is already at one
+    replica, so the profile's ``replicas: 0`` is not re-applied under players.
+    """
     chart = f"{omcsi_dir}/helm/omcsi"
     router_hosts = f"{spec.hostname}\\,{spec.sslip_hostname}"
     argv = [
@@ -211,8 +221,9 @@ def helm_install_argv(
         "--set", f"secrets.adminPassword={creds.admin_password}",
         "--set", f"secrets.deployAuthToken={creds.deploy_auth_token}",
         "--set", f"secrets.deploymentAuthToken={creds.deployment_auth_token}",
-        "--wait", "--timeout", timeout,
     ]  # fmt: skip
+    if keep_awake:
+        argv += ["--set", "minecraftWrapper.replicas=1"]
     return argv
 
 
@@ -274,11 +285,11 @@ def server_list_ping(host: str, port: int = 25565, timeout: float = 2.0) -> dict
 
 class KubectlHelmBackend:
     def __init__(
-        self, omcsi_dir: str, backup_dir: str, helm_timeout: str = "5m", run=run_command
+        self, omcsi_dir: str, backup_dir: str, rollout_timeout: str = "5m", run=run_command
     ) -> None:
         self.omcsi_dir = omcsi_dir
         self.backup_dir = Path(backup_dir)
-        self.helm_timeout = helm_timeout
+        self.rollout_timeout = rollout_timeout
         self._run = run
 
     def namespace_exists(self, name: str) -> bool:
@@ -311,13 +322,27 @@ class KubectlHelmBackend:
         self._run(["kubectl", "apply", "-f", "-"], stdin=json.dumps(secret))
 
     def install_release(self, spec: ReleaseSpec, creds: Credentials) -> None:
-        self._run(helm_install_argv(spec, creds, self.omcsi_dir, self.helm_timeout))
+        current = self.wrapper_status(spec.name)
+        keep_awake = current.exists and current.replicas >= 1
+        self._run(helm_install_argv(spec, creds, self.omcsi_dir, keep_awake=keep_awake))
 
     def scale_wrapper(self, name: str, replicas: int) -> None:
         self._run([
             "kubectl", "-n", namespace_for(name), "scale", "statefulset",
             f"{name}{WRAPPER_STS_SUFFIX}", f"--replicas={replicas}",
         ])  # fmt: skip
+
+    def wait_for_rollout(self, name: str) -> None:
+        ns = namespace_for(name)
+        for target in (
+            f"statefulset/{name}{WRAPPER_STS_SUFFIX}",
+            f"deployment/{name}-omcsi-webapp",
+            f"deployment/{name}-omcsi-nginx",
+        ):
+            self._run([
+                "kubectl", "-n", ns, "rollout", "status", target,
+                f"--timeout={self.rollout_timeout}",
+            ])  # fmt: skip
 
     def wrapper_status(self, name: str) -> WrapperStatus:
         ns = namespace_for(name)
@@ -453,9 +478,11 @@ class FakeClusterBackend:
         self.credentials[name] = creds
 
     def install_release(self, spec: ReleaseSpec, creds: Credentials) -> None:
-        self._op("install_release", spec.name)
+        current = self.wrappers.get(spec.name, WrapperStatus(exists=False))
+        keep_awake = current.exists and current.replicas >= 1
+        self._op("install_release", spec.name, keep_awake)
         self.releases[spec.name] = spec
-        self.wrappers[spec.name] = WrapperStatus(exists=True, replicas=0)
+        self.wrappers[spec.name] = WrapperStatus(exists=True, replicas=1 if keep_awake else 0)
 
     def scale_wrapper(self, name: str, replicas: int) -> None:
         self._op("scale_wrapper", name, replicas)
@@ -463,6 +490,13 @@ class FakeClusterBackend:
         if current is None or not current.exists:
             raise ClusterError(f"statefulset {name}{WRAPPER_STS_SUFFIX} not found")
         self.wrappers[name] = replace(current, replicas=replicas, ready_replicas=0)
+
+    def wait_for_rollout(self, name: str) -> None:
+        self._op("wait_for_rollout", name)
+        current = self.wrappers.get(name)
+        if current is None or current.replicas < 1:
+            raise ClusterError(f"rollout of {name}{WRAPPER_STS_SUFFIX} timed out (simulated)")
+        self.wrappers[name] = replace(current, ready_replicas=1)
 
     def wrapper_status(self, name: str) -> WrapperStatus:
         return self.wrappers.get(name, WrapperStatus(exists=False))

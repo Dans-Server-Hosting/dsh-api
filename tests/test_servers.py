@@ -16,18 +16,18 @@ def test_create_provisions_like_the_operator_script(client, cluster, created):
     assert created["sslip_hostname"] == "alpha.203-0-113-10.sslip.io"
     assert created["dashboard_url"] == "https://alpha.play.example.com/"
     assert created["motd"] == "alpha on Dan's Server Hosting"
-    assert created["state"] == "waking"  # scaled to 1 right after install
+    assert created["state"] == "awake"  # woken after install, rollouts waited for
     assert created["last_woken_at"]
     assert created["admin_username"] == "admin"
     assert created["admin_password"] == cluster.credentials["alpha"].admin_password
 
-    assert [op[0] for op in cluster.ops] == [
-        "create_tenant_namespace",
-        "create_credentials",
-        "install_release",
-        "scale_wrapper",
+    assert cluster.ops == [
+        ("create_tenant_namespace", "alpha"),
+        ("create_credentials", "alpha"),
+        ("install_release", "alpha", False),  # the profile's replicas: 0 stands
+        ("scale_wrapper", "alpha", 1),  # woken once, so the webapp can start
+        ("wait_for_rollout", "alpha"),  # only now: helm itself must not wait
     ]
-    assert cluster.ops[-1] == ("scale_wrapper", "alpha", 1)
     assert "t-alpha" in cluster.namespaces
     assert cluster.releases["alpha"] == ReleaseSpec(
         name="alpha",
@@ -100,15 +100,18 @@ def test_admin_password_is_returned_exactly_once(client, created):
     assert creds.rcon_password not in dumped
 
 
-def test_create_failure_is_502_and_recorded(client, cluster, db):
-    cluster.fail_on.add("install_release")
+@pytest.mark.parametrize(
+    "step, state_after", [("install_release", "failed"), ("wait_for_rollout", "waking")]
+)
+def test_create_failure_is_502_and_recorded(client, cluster, db, step, state_after):
+    cluster.fail_on.add(step)
     resp = client.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE)
     assert resp.status_code == 502
-    assert "install_release" in resp.json()["detail"]
+    assert step in resp.json()["detail"]
     kinds = [e["kind"] for e in db.events("alpha")]
     assert kinds == ["create.requested", "create.failed"]
-    # The row stays so the tenant can see it failed and remove it.
-    assert client.get("/api/v1/servers/alpha", headers=ALICE).json()["state"] == "failed"
+    # The row stays so the tenant can see what became of it and remove it.
+    assert client.get("/api/v1/servers/alpha", headers=ALICE).json()["state"] == state_after
 
 
 # --- read ------------------------------------------------------------------
@@ -118,9 +121,9 @@ def test_list_and_get_report_state_transitions(client, cluster, created):
     def state():
         return client.get("/api/v1/servers/alpha", headers=ALICE).json()["state"]
 
-    assert state() == "waking"
-    cluster.become_ready("alpha")
     assert state() == "awake"
+    cluster.wrappers["alpha"] = WrapperStatus(exists=True, replicas=1, ready_replicas=0)
+    assert state() == "waking"
     # The router puts the server to sleep when idle.
     cluster.wrappers["alpha"] = WrapperStatus(exists=True, replicas=0)
     assert state() == "asleep"
@@ -136,6 +139,7 @@ def test_list_and_get_report_state_transitions(client, cluster, created):
 
 def test_get_includes_player_count_when_awake(client, cluster, created):
     cluster.players["alpha"] = 3
+    cluster.wrappers["alpha"] = WrapperStatus(exists=True, replicas=1, ready_replicas=0)
     assert client.get("/api/v1/servers/alpha", headers=ALICE).json()["players_online"] is None
     cluster.become_ready("alpha")
     assert client.get("/api/v1/servers/alpha", headers=ALICE).json()["players_online"] == 3
@@ -189,7 +193,6 @@ def test_wake_scales_the_wrapper_to_one(client, cluster, created):
 
 
 def test_wake_when_already_up_does_nothing(client, cluster, created):
-    cluster.become_ready("alpha")
     n_ops = len(cluster.ops)
     resp = client.post("/api/v1/servers/alpha/wake", headers=ALICE)
     assert resp.status_code == 200
@@ -227,14 +230,12 @@ def test_delete_backs_up_before_the_namespace_goes(client, cluster, created, db)
 
 
 def test_delete_of_an_awake_server_uses_exec(client, cluster, created):
-    cluster.become_ready("alpha")
     cluster.players["alpha"] = 0
     assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 200
     assert ("backup_world", "alpha", True) in cluster.ops
 
 
 def test_delete_refuses_while_players_are_online_unless_forced(client, cluster, created):
-    cluster.become_ready("alpha")
     cluster.players["alpha"] = 2
     resp = client.delete("/api/v1/servers/alpha", headers=ALICE)
     assert resp.status_code == 409
@@ -285,3 +286,15 @@ def test_create_rejects_impossible_operator_usernames(client, cluster, username)
     )
     assert resp.status_code == 422
     assert cluster.ops == []
+
+
+def test_fake_install_keeps_an_awake_wrapper_awake(cluster):
+    """Mirrors the real backend: a re-run over a wrapper at 1 replica must not sleep it."""
+    spec = ReleaseSpec(name="alpha", hostname="h", sslip_hostname="s", motd="m")
+    cluster.install_release(spec, Credentials.generate())
+    assert cluster.ops[-1] == ("install_release", "alpha", False)
+    assert cluster.wrapper_status("alpha").replicas == 0
+    cluster.scale_wrapper("alpha", 1)
+    cluster.install_release(spec, Credentials.generate())
+    assert cluster.ops[-1] == ("install_release", "alpha", True)
+    assert cluster.wrapper_status("alpha").replicas == 1

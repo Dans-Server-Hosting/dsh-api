@@ -51,7 +51,7 @@ class Settings:
     node_ip: str = ""
     omcsi_dir: str = "/opt/omcsi"
     backup_dir: str = "/backups"
-    helm_timeout: str = "5m"
+    rollout_timeout: str = "5m"
     max_servers_per_tenant: int = 1
     limits: Limits = field(default_factory=Limits)
 
@@ -65,7 +65,7 @@ class Settings:
             node_ip=env.get("DSH_NODE_IP", cls.node_ip),
             omcsi_dir=env.get("OMCSI_CHART_DIR", cls.omcsi_dir),
             backup_dir=env.get("DSH_BACKUP_DIR", cls.backup_dir),
-            helm_timeout=env.get("DSH_HELM_TIMEOUT", cls.helm_timeout),
+            rollout_timeout=env.get("DSH_ROLLOUT_TIMEOUT", cls.rollout_timeout),
             max_servers_per_tenant=int(
                 env.get("DSH_MAX_SERVERS_PER_TENANT", cls.max_servers_per_tenant)
             ),

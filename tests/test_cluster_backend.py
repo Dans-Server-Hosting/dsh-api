@@ -62,7 +62,7 @@ def backend(tmp_path):
 
 
 def test_helm_install_line_matches_the_operator_script():
-    argv = helm_install_argv(SPEC, CREDS, "/opt/omcsi", "5m")
+    argv = helm_install_argv(SPEC, CREDS, "/opt/omcsi")
     assert argv == [
         "helm", "upgrade", "--install", "alpha", "/opt/omcsi/helm/omcsi",
         "-n", "t-alpha",
@@ -84,13 +84,46 @@ def test_helm_install_line_matches_the_operator_script():
         "--set", "secrets.adminPassword=admin-x",
         "--set", "secrets.deployAuthToken=deploy-x",
         "--set", "secrets.deploymentAuthToken=deployment-x",
-        "--wait", "--timeout", "5m",
     ]  # fmt: skip
+    assert "--wait" not in argv  # the webapp waits for the wrapper; helm must not wait for both
+
+
+def test_helm_install_keeps_an_awake_wrapper_awake():
+    argv = helm_install_argv(SPEC, CREDS, "/opt/omcsi", keep_awake=True)
+    assert argv[-2:] == ["--set", "minecraftWrapper.replicas=1"]
+
+
+def test_install_release_reads_the_wrapper_first(tmp_path):
+    # Fresh tenant: no StatefulSet, so the profile's replicas: 0 stands.
+    runner = Runner(ClusterError('statefulsets.apps "x" not found'), "")
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path), run=runner)
+    be.install_release(SPEC, CREDS)
+    assert runner.calls[0][0][3:5] == ["get", "statefulset"]
+    assert "minecraftWrapper.replicas=1" not in runner.calls[1][0]
+    # Re-run under players: the wrapper is at 1, so it is kept there.
+    runner = Runner(sts(1, 1), pods(), "")
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path), run=runner)
+    be.install_release(SPEC, CREDS)
+    assert runner.calls[-1][0][-2:] == ["--set", "minecraftWrapper.replicas=1"]
+
+
+def test_wait_for_rollout_covers_wrapper_webapp_and_nginx(tmp_path):
+    runner = Runner()
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path), "7m", run=runner)
+    be.wait_for_rollout("alpha")
+    assert [c[0] for c in runner.calls] == [
+        ["kubectl", "-n", "t-alpha", "rollout", "status", target, "--timeout=7m"]
+        for target in (
+            "statefulset/alpha-omcsi-minecraft-wrapper",
+            "deployment/alpha-omcsi-webapp",
+            "deployment/alpha-omcsi-nginx",
+        )
+    ]
 
 
 def test_helm_install_without_operator_omits_operator_flags():
     spec = ReleaseSpec(name="a", hostname="h", sslip_hostname="s", motd="m")
-    argv = helm_install_argv(spec, CREDS, "/opt/omcsi", "5m")
+    argv = helm_install_argv(spec, CREDS, "/opt/omcsi")
     assert not any("OPERATOR" in a for a in argv)
 
 
