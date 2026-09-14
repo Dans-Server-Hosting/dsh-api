@@ -13,8 +13,8 @@
 
 | Method | Path | Does |
 |---|---|---|
-| `POST` | `/api/v1/servers` | `{name, motd?, operator_username?}` → provisions (namespace + quota + OMCSI release from the co-located profile). 201 with the server. 409 if the name is taken, 403 if the tenant is at cap. |
-| `GET` | `/api/v1/servers` | the caller's servers with `state: asleep|waking|awake|stopped|failed`, hostname, dashboard URL |
+| `POST` | `/api/v1/servers` | `{name, motd?, operator_username?}` → provisions (namespace + quota + OMCSI release from the co-located profile). 202 with the server in state `provisioning`; the steps run in the background. 409 if the name is taken or the tenant's earlier create is still running, 403 if the tenant is at cap. |
+| `GET` | `/api/v1/servers` | the caller's servers with `state: provisioning|asleep|waking|awake|stopped|failed`, hostname, dashboard URL |
 | `GET` | `/api/v1/servers/{name}` | one server, plus last-woken and player count when awake |
 | `POST` | `/api/v1/servers/{name}/wake` | scales the wrapper to 1, or starts the game in a pod that is up with the game stopped (the panel's Start button); 202 |
 | `DELETE` | `/api/v1/servers/{name}` | backs up the world, uninstalls, removes the namespace. 409 while players are online unless `?force=true` |
@@ -36,6 +36,17 @@ hours while nobody could join, and `wake` (replicas already 1) did nothing.
 The API now also asks the wrapper's `/api/server/status`; a Ready pod whose
 game is not running is `stopped`, and `wake` starts the game in place. See the
 state table in the README.
+
+*Also since the MVP:* create is asynchronous. The MVP's `POST` held the
+request open for the whole install (about 90 s on the node), and a second
+`POST` from the same account in that window was answered with the cap 403 —
+misleading, since the first was succeeding. `POST` now reserves the row as
+`provisioning` and answers 202; the cluster steps run on a thread pool in the
+API; `GET` reports `provisioning` until they finish, then the cluster's
+reading, or `failed` (with the error as a `create.failed` event). A second
+create while one is running is a 409 naming the pending server. The
+namespace and release of a failed create are left for inspection; the slot
+is released by `DELETE`, which tolerates a missing pod or volume.
 
 ## Not in the MVP
 

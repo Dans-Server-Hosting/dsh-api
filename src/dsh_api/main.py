@@ -1,5 +1,6 @@
 """FastAPI application. Build it with ``create_app`` (uvicorn: ``--factory``)."""
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from typing import Annotated, Literal
 
@@ -15,6 +16,8 @@ from dsh_api.db import Database
 from dsh_api.feedback import FeedbackNotFound, FeedbackRateLimited, FeedbackService
 from dsh_api.mojang import MojangResolver, UnknownUsername, UuidResolver
 from dsh_api.service import (
+    CreateInProgress,
+    JobRunner,
     NameTaken,
     PlayersOnline,
     ServerNotFound,
@@ -59,6 +62,7 @@ def create_app(
     cluster: ClusterBackend | None = None,
     validator: TokenValidator | None = None,
     uuids: UuidResolver | None = None,
+    jobs: JobRunner | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     db = db or Database(settings.db_path)
@@ -67,13 +71,18 @@ def create_app(
     )
     validator = validator or Hs256Validator(settings.jwt_secret)
     uuids = uuids or MojangResolver()
-    service = ServerService(settings, db, cluster, uuids)
+    # Provisioning runs off the request thread; two at a time is plenty for a
+    # node that hosts a dozen servers, and keeps kubectl/helm from piling up.
+    jobs = jobs or ThreadPoolExecutor(max_workers=2, thread_name_prefix="dsh-provision")
+    service = ServerService(settings, db, cluster, uuids, jobs)
+    service.recover_interrupted()
     feedback = FeedbackService(db)
 
     app = FastAPI(title="dsh-api", version=__version__)
     app.state.settings = settings
     app.state.service = service
     app.state.feedback = feedback
+    app.state.jobs = jobs
 
     def current_tenant(authorization: Annotated[str | None, Header()] = None) -> str:
         try:
@@ -96,6 +105,14 @@ def create_app(
     def _cluster_error(_: Request, exc: ClusterError) -> JSONResponse:
         return JSONResponse({"detail": f"cluster operation failed: {exc}"}, status_code=502)
 
+    @app.exception_handler(CreateInProgress)
+    def _create_in_progress(_: Request, exc: CreateInProgress) -> JSONResponse:
+        # Distinct from the cap 403: the earlier request is succeeding, not refused.
+        return JSONResponse(
+            {"detail": "a server is already being created for this account", "server": exc.name},
+            status_code=409,
+        )
+
     @app.get("/healthz")
     def healthz() -> dict:
         return {"status": "ok", "version": __version__}
@@ -108,8 +125,10 @@ def create_app(
     def list_servers(tenant: Tenant) -> list[dict]:
         return [asdict(s) for s in service.list(tenant)]
 
-    @app.post("/api/v1/servers", status_code=201)
+    @app.post("/api/v1/servers", status_code=202)
     def create_server(tenant: Tenant, body: CreateServer) -> dict:
+        """Reserve the server and answer at once; ``GET`` reports ``provisioning``
+        until the background steps have finished. The admin password is here only."""
         try:
             view, admin_password = service.create(
                 tenant, body.name, body.motd, body.operator_username
@@ -140,10 +159,16 @@ def create_app(
 
     @app.delete("/api/v1/servers/{name}")
     def delete_server(tenant: Tenant, name: str, force: bool = False) -> dict:
+        """Back up, uninstall and remove the namespace. Works for a ``failed``
+        create too (its backup is skipped when there is nothing to read)."""
         try:
             backup = service.delete(tenant, name, force=force)
         except ServerNotFound:
             raise HTTPException(404, "no such server") from None
+        except CreateInProgress:
+            raise HTTPException(
+                409, "the server is still being created; wait for it to finish"
+            ) from None
         except PlayersOnline as exc:
             raise HTTPException(
                 409, f"{exc.count} player(s) online; pass ?force=true to disconnect them"

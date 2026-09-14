@@ -47,7 +47,7 @@ elif name == "kubectl" and "exec" in argv:
 
 
 @pytest.fixture
-def stubbed(tmp_path, monkeypatch):
+def stubbed(tmp_path, monkeypatch, jobs):
     bindir = tmp_path / "bin"
     bindir.mkdir()
     for tool in ("kubectl", "helm"):
@@ -77,8 +77,9 @@ def stubbed(tmp_path, monkeypatch):
         cluster=KubectlHelmBackend(settings.omcsi_dir, settings.backup_dir, http=wrapper_http),
         validator=FakeValidator({"t": "alice"}),
         uuids=FakeResolver(),
+        jobs=jobs,
     )
-    return TestClient(app), log, http_calls
+    return TestClient(app), log, http_calls, jobs
 
 
 def calls(log: Path) -> list[dict]:
@@ -86,11 +87,15 @@ def calls(log: Path) -> list[dict]:
 
 
 def test_create_get_and_delete_through_real_subprocesses(stubbed):
-    client, log, http_calls = stubbed
+    client, log, http_calls, jobs = stubbed
     auth = {"Authorization": "Bearer t"}
 
     resp = client.post("/api/v1/servers", json={"name": "alpha", "motd": "hey"}, headers=auth)
-    assert resp.status_code == 201, resp.text
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["state"] == "provisioning"
+    # Only the name check has run before the answer; the rest is the job's.
+    assert [c["argv"][1:3] for c in calls(log)] == [["get", "namespace"]]
+    assert jobs.run() == 1
     seen = calls(log)
     tools = [os.path.basename(c["argv"][0]) + " " + " ".join(c["argv"][1:3]) for c in seen]
     assert tools == [
@@ -103,8 +108,6 @@ def test_create_get_and_delete_through_real_subprocesses(stubbed):
         "kubectl -n t-alpha",  # rollout status statefulset
         "kubectl -n t-alpha",  # rollout status webapp
         "kubectl -n t-alpha",  # rollout status nginx
-        "kubectl -n t-alpha",  # statefulset read for the response
-        "kubectl -n t-alpha",  # pods read
     ]
     assert json.loads(seen[1]["stdin"])["kind"] == "List"
     assert json.loads(seen[2]["stdin"])["metadata"]["name"] == "dsh-credentials"

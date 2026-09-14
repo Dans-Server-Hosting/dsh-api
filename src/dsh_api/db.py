@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS servers (
     motd TEXT NOT NULL,
     operator_username TEXT,
     created_at TEXT NOT NULL,
-    last_woken_at TEXT
+    last_woken_at TEXT,
+    status TEXT NOT NULL DEFAULT 'ready'
 );
 CREATE INDEX IF NOT EXISTS servers_tenant ON servers(tenant_id);
 CREATE TABLE IF NOT EXISTS events (
@@ -44,6 +45,15 @@ CREATE TABLE IF NOT EXISTS feedback (
 );
 """
 
+MIGRATIONS = {
+    # (table, column): the ALTER that adds it to a database created before it existed.
+    ("servers", "status"): "ALTER TABLE servers ADD COLUMN status TEXT NOT NULL DEFAULT 'ready'",
+}
+
+ROW_STATUSES = ("provisioning", "ready", "failed")
+"""What the row says about the create: in flight, done (the cluster decides the
+state from here on), or failed (the row keeps the tenant's slot until DELETE)."""
+
 
 def now_iso() -> str:
     return _iso(datetime.now(UTC))
@@ -62,6 +72,7 @@ class ServerRow:
     operator_username: str | None
     created_at: str
     last_woken_at: str | None
+    status: str = "ready"
 
 
 @dataclass(frozen=True)
@@ -79,6 +90,10 @@ class Database:
         self.path = path
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            for (table, column), alter in MIGRATIONS.items():
+                present = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+                if column not in present:
+                    conn.execute(alter)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -102,13 +117,19 @@ class Database:
     # --- servers -----------------------------------------------------------
 
     def insert_server(
-        self, name: str, tenant_id: str, hostname: str, motd: str, operator_username: str | None
+        self,
+        name: str,
+        tenant_id: str,
+        hostname: str,
+        motd: str,
+        operator_username: str | None,
+        status: str = "provisioning",
     ) -> ServerRow:
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO servers (name, tenant_id, hostname, motd, operator_username,"
-                " created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (name, tenant_id, hostname, motd, operator_username, now_iso()),
+                " created_at, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (name, tenant_id, hostname, motd, operator_username, now_iso(), status),
             )
         return self.get_server(name)  # type: ignore[return-value]
 
@@ -131,6 +152,29 @@ class Database:
                 "SELECT COUNT(*) FROM servers WHERE tenant_id = ?", (tenant_id,)
             ).fetchone()
         return int(n)
+
+    def provisioning_server(self, tenant_id: str) -> ServerRow | None:
+        """The tenant's server whose create is still in flight, if any."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM servers WHERE tenant_id = ? AND status = 'provisioning'"
+                " ORDER BY created_at, name LIMIT 1",
+                (tenant_id,),
+            ).fetchone()
+        return ServerRow(**row) if row else None
+
+    def list_provisioning(self) -> list[ServerRow]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM servers WHERE status = 'provisioning' ORDER BY created_at, name"
+            ).fetchall()
+        return [ServerRow(**r) for r in rows]
+
+    def set_status(self, name: str, status: str) -> None:
+        if status not in ROW_STATUSES:
+            raise ValueError(f"unknown server status {status!r}")
+        with self._connect() as conn:
+            conn.execute("UPDATE servers SET status = ? WHERE name = ?", (status, name))
 
     def mark_woken(self, name: str) -> None:
         with self._connect() as conn:

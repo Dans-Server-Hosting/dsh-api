@@ -424,10 +424,14 @@ def test_backup_of_an_awake_server_execs_tar(tmp_path):
 
 
 def test_backup_of_an_asleep_server_mounts_the_pvc_in_a_throwaway_pod(tmp_path):
-    runner = Runner("tarball-bytes")
+    runner = Runner("persistentvolumeclaim/alpha-omcsi-mcserver\n", "tarball-bytes")
     be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
     be.backup_world("alpha", awake=False)
-    argv = runner.calls[0][0]
+    # The claim is looked up first, so a missing one fails fast instead of
+    # leaving a reader pod Pending.
+    assert runner.calls[0][0] == ["kubectl", "-n", "t-alpha", "get", "pvc", "alpha-omcsi-mcserver",
+                                  "-o", "name"]  # fmt: skip
+    argv = runner.calls[1][0]
     assert argv[:9] == ["kubectl", "-n", "t-alpha", "run", "backup-reader", "--rm", "-i",
                         "--restart=Never", "--image=busybox:1.36"]  # fmt: skip
     overrides = json.loads(argv[9].removeprefix("--overrides="))
@@ -439,6 +443,16 @@ def test_backup_of_an_asleep_server_mounts_the_pvc_in_a_throwaway_pod(tmp_path):
     )
 
 
+def test_backup_of_a_server_without_a_world_volume_fails_fast(tmp_path):
+    """A create that failed before helm ran has no PVC; nothing is started for it."""
+    runner = Runner(ClusterError('persistentvolumeclaims "alpha-omcsi-mcserver" not found'))
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
+    with pytest.raises(ClusterError, match="not found"):
+        be.backup_world("alpha", awake=False)
+    assert len(runner.calls) == 1  # no ``kubectl run``
+    assert not (tmp_path / "b").exists() or list((tmp_path / "b").iterdir()) == []
+
+
 def test_empty_backup_is_refused_and_removed(tmp_path):
     be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=Runner(""))
     with pytest.raises(ClusterError, match="empty"):
@@ -447,7 +461,8 @@ def test_empty_backup_is_refused_and_removed(tmp_path):
 
 
 def test_failed_backup_leaves_no_file(tmp_path):
-    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=Runner(ClusterError("boom")))
+    runner = Runner("persistentvolumeclaim/alpha-omcsi-mcserver\n", ClusterError("boom"))
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
     with pytest.raises(ClusterError, match="boom"):
         be.backup_world("alpha", awake=False)
     assert list((tmp_path / "b").iterdir()) == []

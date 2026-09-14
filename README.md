@@ -21,12 +21,18 @@ what remains (see the MVP done-when list).
   (`src/dsh_api/cluster.py`), with a real `KubectlHelmBackend` and a
   `FakeClusterBackend` used by the tests. Nothing in the test suite needs a
   cluster or the network.
-- State is one SQLite file: `tenants`, `servers` (who owns what), `events` and
-  `feedback` (what signed-in people said about the portal, for the admins).
-  The cluster stays the source of truth for whether a server exists and what
-  state it is in: the wrapper StatefulSet says whether the pod is up, and the
-  wrapper's own API (`/api/server/status` on its internal Service, port 8092)
-  says whether the game process is running inside it.
+- State is one SQLite file: `tenants`, `servers` (who owns what, and whether
+  its create is still in flight), `events` and `feedback` (what signed-in
+  people said about the portal, for the admins). Once a server is created the
+  cluster is the source of truth for whether it exists and what state it is
+  in: the wrapper StatefulSet says whether the pod is up, and the wrapper's
+  own API (`/api/server/status` on its internal Service, port 8092) says
+  whether the game process is running inside it.
+- Creating a server takes minutes (helm install, a wake, three rollouts), so
+  `POST /api/v1/servers` answers at once and the cluster steps run on a small
+  thread pool inside the API process (two at a time). The row is the record
+  of that job: `provisioning` until it finishes, then the cluster's reading,
+  or `failed`.
 - The player count comes from the game server's own status handshake
   (server list ping) against the wrapper Service inside the cluster.
 
@@ -34,11 +40,19 @@ what remains (see the MVP done-when list).
 
 | `state` | StatefulSet | Wrapper says | Meaning |
 |---|---|---|---|
+| `provisioning` | *(not asked)* | *(not asked)* | the create was accepted and its steps are still running; `wake` is a no-op and `DELETE` is refused (409) until it finishes |
 | `asleep` | 0 replicas | *(not asked)* | scaled down by the router or never woken; `wake` scales it up |
 | `waking` | 1 replica, pod not Ready — or Ready with `running: false` less than 3 minutes after the scale-up | booting | the pod or the game is still coming up |
 | `awake` | 1 replica, pod Ready | `running: true` | joinable; `players_online` is reported on `GET /api/v1/servers/{name}` |
 | `stopped` | 1 replica, pod Ready | `running: false` | the game process exited (Stop in the dashboard, or a crash) while the pod stayed up; `wake` starts it in place |
-| `failed` | missing, or a pod in `CrashLoopBackOff` / `ImagePullBackOff` / `Failed` | *(not asked)* | needs the operator |
+| `failed` | missing, or a pod in `CrashLoopBackOff` / `ImagePullBackOff` / `Failed` — or the create itself failed, whatever the cluster says | *(not asked)* | needs the operator; a failed create keeps the tenant's slot until `DELETE`, which works without a pod or volume to back up |
+
+`provisioning` and a failed create are read from the row, not the cluster:
+during the create the release may not exist yet, and after a failure the
+namespace and release are left as they are for inspection (the error is in
+the `events` table as `create.failed`). If the API restarts mid-create the
+row is marked failed on startup (`create.interrupted`); nothing is retried on
+its own.
 
 The pod's readiness probe is the wrapper's Spring health, not the game's, so
 readiness alone cannot tell `awake` from `stopped`. When the wrapper cannot be
@@ -53,24 +67,40 @@ never fails a list or get.
 | `GET` | `/healthz` | liveness |
 | `GET` | `/api/v1/limits` | free-tier profile as numbers; no token needed |
 | `GET` | `/api/v1/servers` | the caller's servers |
-| `POST` | `/api/v1/servers` | `{name, motd?, operator_username?}` → 201; the admin password is in this response **only** |
+| `POST` | `/api/v1/servers` | `{name, motd?, operator_username?}` → **202** with the server in state `provisioning`; the admin password is in this response **only**. 409 `{"detail": "a server is already being created for this account", "server": "<name>"}` while the caller's earlier create is still running; 409 when the name is taken; 403 at the tenant cap |
 | `GET` | `/api/v1/servers/{name}` | one server, with `players_online` when `awake` (`null` otherwise) |
 | `POST` | `/api/v1/servers/{name}/wake` | 202 with the resulting server: `asleep` → scales the wrapper to 1; `stopped` → `POST /api/server/start` on the wrapper; `waking`/`awake` → no-op |
-| `DELETE` | `/api/v1/servers/{name}` | backup, `helm uninstall`, namespace delete; 409 while players are online unless `?force=true` |
+| `DELETE` | `/api/v1/servers/{name}` | backup, `helm uninstall`, namespace delete; 409 while players are online unless `?force=true`; 409 while the server is still `provisioning`; a `failed` create is removed even when there is nothing to back up |
 | `GET` | `/api/v1/me` | `{username, is_admin}` for the caller; admins are the `DSH_ADMIN_USERS` logins |
 | `POST` | `/api/v1/feedback` | `{message (1–4000 chars), page?}` → 201; any signed-in user, at most 10 per user per hour (429) |
 | `GET` | `/api/v1/feedback?status=new\|read\|all` | admin only (403 otherwise); newest first, default `new` |
 | `PATCH` | `/api/v1/feedback/{id}` | `{status: "read"\|"new"}` → the updated item; admin only; 404 for an unknown id |
 
-`POST /api/v1/servers` installs the release without waiting (the profile
-installs the wrapper asleep and the webapp's init container waits for it, so
-`helm --wait` could never finish), wakes the wrapper once, then waits for the
-wrapper, webapp and nginx rollouts (up to `DSH_ROLLOUT_TIMEOUT` each). Expect
-the call to take a few minutes. The release is installed with
+`POST /api/v1/servers` validates the request, reserves the name and the
+tenant's slot, and answers 202 before any cluster work. The steps then run in
+the background: namespace with quota and limit range, the credentials Secret,
+`helm upgrade --install` without waiting (the profile installs the wrapper
+asleep and the webapp's init container waits for it, so `helm --wait` could
+never finish), one wake, then the wrapper, webapp and nginx rollouts (up to
+`DSH_ROLLOUT_TIMEOUT` each). Poll `GET /api/v1/servers/{name}` until `state`
+leaves `provisioning`; expect a few minutes. The release is installed with
 `minecraftWrapper.env.DEFAULT_PLUGINS` set from `DSH_DEFAULT_PLUGINS`, so a new
 server starts with Dan's Plugin Manager the way the operator's script installs
 it (commas in the list are escaped for `helm --set`, which would otherwise
 split them).
+
+### Contract note for the portal
+
+- Create is `202`, not `201`, and the server it returns is `provisioning`.
+  The response is otherwise the same shape as before, `admin_username` and
+  `admin_password` included — show the password now; it is never repeated.
+- Add `provisioning` to the state pill and keep polling the server while it
+  is in that state; `wake` and `delete` are not offered for it.
+- A `409` whose body carries `server` means the account's earlier create is
+  still running — point at that server rather than reporting a limit. The
+  cap `403` is unchanged and only ever means the account is full.
+- A `failed` server may be a create that failed: it still counts against the
+  cap, and `DELETE` (no `force` needed) is how the account gets its slot back.
 
 ## Running locally
 
