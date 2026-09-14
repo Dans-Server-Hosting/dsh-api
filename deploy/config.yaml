@@ -8,6 +8,9 @@ data:
   DSH_BASE_DOMAIN: "dansserverhosting.com"
   DSH_NODE_IP: "203.0.113.10" # the node's public address, for <name>.<ip-dashed>.sslip.io
   DSH_MAX_SERVERS_PER_TENANT: "1"
+  DSH_ADMIN_USERS: "dmccoystephenson" # comma-separated logins that may read feedback
+  # Comma-separated plugin download URLs every new server is installed with.
+  DSH_DEFAULT_PLUGINS: "https://github.com/Dans-Plugins/Dans-Plugin-Manager/releases/download/v0.7.0-SNAPSHOT-8-8-2026/DansPluginManager-0.7.0-SNAPSHOT-8-8-2026.jar"
   DSH_DB_PATH: /data/dsh-api.db
   DSH_BACKUP_DIR: /backups
   OMCSI_CHART_DIR: /opt/omcsi

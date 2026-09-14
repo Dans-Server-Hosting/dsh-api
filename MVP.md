@@ -33,7 +33,10 @@
 
 - Quotas beyond "N servers per tenant"; billing; anything paid.
 - Plugin or world upload — the OMCSI dashboard already does both.
-- An admin API (the operator uses the cluster scripts).
+- An admin API (the operator uses the cluster scripts). *Since the MVP: user
+  feedback (`POST /api/v1/feedback`, listed and triaged by the `DSH_ADMIN_USERS`
+  logins) and `GET /api/v1/me` were added for the portal; server administration
+  is still done with the scripts.*
 - Replacing its internals with the fleet control plane's API — that is the intended second step and the interface above is shaped so it can be.
 
 ## Depends on

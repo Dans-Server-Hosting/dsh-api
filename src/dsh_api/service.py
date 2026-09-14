@@ -113,6 +113,7 @@ class ServerService:
             motd=motd,
             operator_name=operator_username,
             operator_uuid=operator_uuid,
+            default_plugins=self.settings.default_plugins,
         )
         creds = Credentials.generate()
         row = self.db.insert_server(name, tenant_id, spec.hostname, motd, operator_username)

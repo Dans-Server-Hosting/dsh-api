@@ -21,7 +21,8 @@ what remains (see the MVP done-when list).
   (`src/dsh_api/cluster.py`), with a real `KubectlHelmBackend` and a
   `FakeClusterBackend` used by the tests. Nothing in the test suite needs a
   cluster or the network.
-- State is one SQLite file: `tenants`, `servers` (who owns what) and `events`.
+- State is one SQLite file: `tenants`, `servers` (who owns what), `events` and
+  `feedback` (what signed-in people said about the portal, for the admins).
   The cluster stays the source of truth for whether a server exists and what
   state it is in (`asleep | waking | awake | failed`, read from the wrapper
   StatefulSet).
@@ -39,12 +40,20 @@ what remains (see the MVP done-when list).
 | `GET` | `/api/v1/servers/{name}` | one server, with `players_online` when awake |
 | `POST` | `/api/v1/servers/{name}/wake` | scales the wrapper to 1 |
 | `DELETE` | `/api/v1/servers/{name}` | backup, `helm uninstall`, namespace delete; 409 while players are online unless `?force=true` |
+| `GET` | `/api/v1/me` | `{username, is_admin}` for the caller; admins are the `DSH_ADMIN_USERS` logins |
+| `POST` | `/api/v1/feedback` | `{message (1–4000 chars), page?}` → 201; any signed-in user, at most 10 per user per hour (429) |
+| `GET` | `/api/v1/feedback?status=new\|read\|all` | admin only (403 otherwise); newest first, default `new` |
+| `PATCH` | `/api/v1/feedback/{id}` | `{status: "read"\|"new"}` → the updated item; admin only; 404 for an unknown id |
 
 `POST /api/v1/servers` installs the release without waiting (the profile
 installs the wrapper asleep and the webapp's init container waits for it, so
 `helm --wait` could never finish), wakes the wrapper once, then waits for the
 wrapper, webapp and nginx rollouts (up to `DSH_ROLLOUT_TIMEOUT` each). Expect
-the call to take a few minutes.
+the call to take a few minutes. The release is installed with
+`minecraftWrapper.env.DEFAULT_PLUGINS` set from `DSH_DEFAULT_PLUGINS`, so a new
+server starts with Dan's Plugin Manager the way the operator's script installs
+it (commas in the list are escaped for `helm --set`, which would otherwise
+split them).
 
 ## Running locally
 
@@ -73,6 +82,8 @@ OMCSI checkout at `OMCSI_CHART_DIR` (the image provides all three).
 | `DSH_BACKUP_DIR` | `/backups` | where `DELETE` writes `<name>-<timestamp>.tar.gz` |
 | `DSH_ROLLOUT_TIMEOUT` | `5m` | per-object `kubectl rollout status` timeout after install |
 | `DSH_MAX_SERVERS_PER_TENANT` | `1` | the cap behind the 403 |
+| `DSH_ADMIN_USERS` | `dmccoystephenson` | comma-separated JWT `sub`s that may read and triage feedback |
+| `DSH_DEFAULT_PLUGINS` | Dan's Plugin Manager `0.7.0-SNAPSHOT-8-8-2026` release jar | comma-separated plugin download URLs every new server is installed with; empty for none |
 | `DSH_LIMIT_HEAP_GB` | `3` | free-tier profile served by `GET /api/v1/limits` |
 | `DSH_LIMIT_MEMORY_LIMIT_GIB` | `3.5` | " |
 | `DSH_LIMIT_WORLD_QUOTA_GIB` | `5` | " |
@@ -104,6 +115,7 @@ src/dsh_api/
   auth.py      JWT validation (real + fake)
   cluster.py   ClusterBackend: kubectl/helm backend + in-memory fake
   service.py   create / list / get / wake / delete
+  feedback.py  submit / list / triage user feedback
   db.py        SQLite schema and queries
   mojang.py    operator UUID lookup (real + fake)
   config.py    settings and the limits profile

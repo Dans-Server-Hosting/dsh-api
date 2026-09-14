@@ -1,8 +1,12 @@
 """Every handler against the fake cluster."""
 
 import pytest
+from fastapi.testclient import TestClient
 
+from dsh_api.auth import FakeValidator
 from dsh_api.cluster import Credentials, ReleaseSpec, WrapperStatus
+from dsh_api.config import DEFAULT_PLUGINS, Settings
+from dsh_api.main import create_app
 
 ALICE = {"Authorization": "Bearer alice-token"}
 BOB = {"Authorization": "Bearer bob-token"}
@@ -34,7 +38,24 @@ def test_create_provisions_like_the_operator_script(client, cluster, created):
         hostname="alpha.play.example.com",
         sslip_hostname="alpha.203-0-113-10.sslip.io",
         motd="alpha on Dan's Server Hosting",
+        default_plugins=(DEFAULT_PLUGINS,),  # Dan's Plugin Manager, like the operator's script
     )
+
+
+def test_create_passes_the_configured_default_plugins(settings, db, cluster, resolver):
+    settings = Settings(
+        **{**vars(settings), "default_plugins": ("https://a/x.jar", "https://b/y.jar")}
+    )
+    app = create_app(
+        settings,
+        db=db,
+        cluster=cluster,
+        validator=FakeValidator({"alice-token": "alice"}),
+        uuids=resolver,
+    )
+    resp = TestClient(app).post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE)
+    assert resp.status_code == 201, resp.text
+    assert cluster.releases["alpha"].default_plugins == ("https://a/x.jar", "https://b/y.jar")
 
 
 def test_create_honours_motd_and_operator(client, cluster):

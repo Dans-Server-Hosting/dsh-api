@@ -5,6 +5,16 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+DEFAULT_ADMIN_USERS = "dmccoystephenson"
+DEFAULT_PLUGINS = (
+    "https://github.com/Dans-Plugins/Dans-Plugin-Manager/releases/download/"
+    "v0.7.0-SNAPSHOT-8-8-2026/DansPluginManager-0.7.0-SNAPSHOT-8-8-2026.jar"
+)
+
+
+def split_csv(value: str) -> tuple[str, ...]:
+    return tuple(item.strip() for item in value.split(",") if item.strip())
+
 
 @dataclass(frozen=True)
 class Limits:
@@ -53,6 +63,8 @@ class Settings:
     backup_dir: str = "/backups"
     rollout_timeout: str = "5m"
     max_servers_per_tenant: int = 1
+    admin_users: frozenset[str] = frozenset(split_csv(DEFAULT_ADMIN_USERS))
+    default_plugins: tuple[str, ...] = split_csv(DEFAULT_PLUGINS)
     limits: Limits = field(default_factory=Limits)
 
     @classmethod
@@ -69,8 +81,13 @@ class Settings:
             max_servers_per_tenant=int(
                 env.get("DSH_MAX_SERVERS_PER_TENANT", cls.max_servers_per_tenant)
             ),
+            admin_users=frozenset(split_csv(env.get("DSH_ADMIN_USERS", DEFAULT_ADMIN_USERS))),
+            default_plugins=split_csv(env.get("DSH_DEFAULT_PLUGINS", DEFAULT_PLUGINS)),
             limits=Limits.from_env(env),
         )
+
+    def is_admin(self, username: str) -> bool:
+        return username in self.admin_users
 
     def hostname(self, name: str) -> str:
         return f"{name}.play.{self.base_domain}"

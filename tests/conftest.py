@@ -20,6 +20,7 @@ def settings(tmp_path: Path) -> Settings:
         omcsi_dir="/opt/omcsi",
         backup_dir=str(tmp_path / "backups"),
         max_servers_per_tenant=1,
+        admin_users=frozenset({"admin"}),
     )
 
 
@@ -44,7 +45,9 @@ def client(settings, db, cluster, resolver) -> TestClient:
         settings,
         db=db,
         cluster=cluster,
-        validator=FakeValidator({"alice-token": "alice", "bob-token": "bob"}),
+        validator=FakeValidator(
+            {"alice-token": "alice", "bob-token": "bob", "admin-token": "admin"}
+        ),
         uuids=resolver,
     )
     return TestClient(app)
