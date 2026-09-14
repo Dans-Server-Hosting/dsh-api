@@ -9,7 +9,7 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tenants (
@@ -34,11 +34,23 @@ CREATE TABLE IF NOT EXISTS events (
     kind TEXT NOT NULL,
     detail TEXT
 );
+CREATE TABLE IF NOT EXISTS feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL,
+    message TEXT NOT NULL,
+    page TEXT,
+    created_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'new'
+);
 """
 
 
 def now_iso() -> str:
-    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return _iso(datetime.now(UTC))
+
+
+def _iso(at: datetime) -> str:
+    return at.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 @dataclass(frozen=True)
@@ -50,6 +62,16 @@ class ServerRow:
     operator_username: str | None
     created_at: str
     last_woken_at: str | None
+
+
+@dataclass(frozen=True)
+class FeedbackRow:
+    id: int
+    username: str
+    message: str
+    page: str | None
+    created_at: str
+    status: str
 
 
 class Database:
@@ -135,3 +157,44 @@ class Database:
                 (server_name,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # --- feedback ----------------------------------------------------------
+
+    def insert_feedback(self, username: str, message: str, page: str | None) -> FeedbackRow:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO feedback (username, message, page, created_at) VALUES (?, ?, ?, ?)",
+                (username, message, page, now_iso()),
+            )
+            feedback_id = cur.lastrowid
+        return self.get_feedback(feedback_id)  # type: ignore[arg-type,return-value]
+
+    def get_feedback(self, feedback_id: int) -> FeedbackRow | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM feedback WHERE id = ?", (feedback_id,)).fetchone()
+        return FeedbackRow(**row) if row else None
+
+    def list_feedback(self, status: str | None = None) -> list[FeedbackRow]:
+        """Newest first; ``status`` narrows to one status, None returns everything."""
+        with self._connect() as conn:
+            if status is None:
+                rows = conn.execute("SELECT * FROM feedback ORDER BY id DESC").fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM feedback WHERE status = ? ORDER BY id DESC", (status,)
+                ).fetchall()
+        return [FeedbackRow(**r) for r in rows]
+
+    def count_feedback_since(self, username: str, window: timedelta) -> int:
+        since = _iso(datetime.now(UTC) - window)
+        with self._connect() as conn:
+            (n,) = conn.execute(
+                "SELECT COUNT(*) FROM feedback WHERE username = ? AND created_at >= ?",
+                (username, since),
+            ).fetchone()
+        return int(n)
+
+    def set_feedback_status(self, feedback_id: int, status: str) -> FeedbackRow | None:
+        with self._connect() as conn:
+            conn.execute("UPDATE feedback SET status = ? WHERE id = ?", (status, feedback_id))
+        return self.get_feedback(feedback_id)
