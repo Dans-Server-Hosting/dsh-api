@@ -4,13 +4,52 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
-from dsh_api.cluster import ClusterBackend, ClusterError, Credentials, ReleaseSpec
+from dsh_api.cluster import (
+    ClusterBackend,
+    ClusterError,
+    Credentials,
+    ReleaseSpec,
+    StatefulSetStatus,
+    WrapperStatus,
+)
 from dsh_api.config import Settings
 from dsh_api.db import Database, ServerRow
 from dsh_api.mojang import UuidResolver
 
 NAME_PATTERN = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
+
+STATES = ("asleep", "waking", "awake", "stopped", "failed")
+
+WAKE_GRACE = timedelta(minutes=3)
+"""How long after a scale-up a not-yet-running game still counts as waking."""
+
+
+def server_state(
+    sts: StatefulSetStatus, wrapper: WrapperStatus | None, now: datetime | None = None
+) -> str:
+    """One of ``STATES`` from the StatefulSet and what the wrapper reports.
+
+    The pod's readiness probe is the wrapper's own health, not the game's, so
+    a ready pod whose wrapper says the process is not running is ``stopped``
+    (the owner pressed Stop in the dashboard, or the game crashed) unless the
+    server was scaled up moments ago and is still booting, which is ``waking``.
+    Without an answer from the wrapper the replica-based reading stands.
+    """
+    if wrapper is None or sts.state in ("failed", "asleep"):
+        return sts.state
+    if sts.ready_replicas < 1:
+        return "waking"
+    if wrapper.running:
+        return "awake"
+    scaled_at = sts.scaled_at
+    if scaled_at is None:
+        return "stopped"
+    if scaled_at.tzinfo is None:
+        scaled_at = scaled_at.replace(tzinfo=UTC)
+    now = now or datetime.now(UTC)
+    return "waking" if now - scaled_at < WAKE_GRACE else "stopped"
 
 
 def validate_name(name: str) -> str:
@@ -64,8 +103,13 @@ class ServerService:
 
     # --- reads ---------------------------------------------------------------
 
+    def _state(self, name: str) -> str:
+        sts = self.cluster.statefulset_status(name)
+        wrapper = self.cluster.wrapper_status(name) if sts.state in ("waking", "awake") else None
+        return server_state(sts, wrapper)
+
     def _view(self, row: ServerRow, with_players: bool) -> ServerView:
-        state = self.cluster.wrapper_status(row.name).state
+        state = self._state(row.name)
         players = (
             self.cluster.players_online(row.name) if with_players and state == "awake" else None
         )
@@ -135,19 +179,29 @@ class ServerService:
         return self._view(self.db.get_server(name) or row, with_players=False), creds.admin_password
 
     def wake(self, tenant_id: str, name: str) -> ServerView:
+        """Scale an asleep wrapper up, or start the game on a stopped one.
+
+        A waking or awake server is left alone, as is a failed one (scaling a
+        crash-looping pod does nothing useful; the failure is reported instead).
+        """
         row = self._owned(tenant_id, name)
-        status = self.cluster.wrapper_status(name)
-        if status.replicas < 1:
+        sts = self.cluster.statefulset_status(name)
+        if sts.replicas < 1:
             self.cluster.scale_wrapper(name, 1)
             self.db.mark_woken(name)
             self.db.record(tenant_id, name, "wake")
+        elif server_state(sts, self.cluster.wrapper_status(name)) == "stopped":
+            self.cluster.start_wrapper(name)
+            self.db.mark_woken(name)
+            self.db.record(tenant_id, name, "wake.start")
         return self._view(self.db.get_server(name) or row, with_players=False)
 
     def delete(self, tenant_id: str, name: str, force: bool = False) -> str | None:
         """Back up, uninstall, remove the namespace. Returns the backup path."""
         self._owned(tenant_id, name)
-        status = self.cluster.wrapper_status(name)
-        awake = status.state == "awake"
+        # The pod being up is what decides how the world is read (exec versus a
+        # PVC reader); a stopped game still has its pod.
+        awake = self.cluster.statefulset_status(name).state == "awake"
         if awake and not force:
             online = self.cluster.players_online(name) or 0
             if online > 0:

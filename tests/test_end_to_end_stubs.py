@@ -64,14 +64,21 @@ def stubbed(tmp_path, monkeypatch):
         omcsi_dir=str(tmp_path / "omcsi"),
         backup_dir=str(tmp_path / "backups"),
     )
+    http_calls = []
+
+    def wrapper_http(url, method="GET", timeout=3.0):
+        # The wrapper's in-cluster hostname does not resolve from here; answer for it.
+        http_calls.append((url, method))
+        return 200, {"running": True, "pid": 1, "uptimeSeconds": 5, "startedAt": "t"}
+
     app = create_app(
         settings,
         db=Database(settings.db_path),
-        cluster=KubectlHelmBackend(settings.omcsi_dir, settings.backup_dir),
+        cluster=KubectlHelmBackend(settings.omcsi_dir, settings.backup_dir, http=wrapper_http),
         validator=FakeValidator({"t": "alice"}),
         uuids=FakeResolver(),
     )
-    return TestClient(app), log
+    return TestClient(app), log, http_calls
 
 
 def calls(log: Path) -> list[dict]:
@@ -79,7 +86,7 @@ def calls(log: Path) -> list[dict]:
 
 
 def test_create_get_and_delete_through_real_subprocesses(stubbed):
-    client, log = stubbed
+    client, log, http_calls = stubbed
     auth = {"Authorization": "Bearer t"}
 
     resp = client.post("/api/v1/servers", json={"name": "alpha", "motd": "hey"}, headers=auth)
@@ -115,6 +122,11 @@ def test_create_get_and_delete_through_real_subprocesses(stubbed):
     assert resp.status_code == 200
     assert resp.json()["state"] == "awake"
     assert resp.json()["players_online"] is None  # no game server to ping
+    assert http_calls[-1] == (
+        "http://alpha-omcsi-minecraft-wrapper-internal.t-alpha.svc.cluster.local:8092"
+        "/api/server/status",
+        "GET",
+    )
 
     resp = client.delete("/api/v1/servers/alpha", headers=auth)
     assert resp.status_code == 200, resp.text
