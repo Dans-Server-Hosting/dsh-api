@@ -1,0 +1,26 @@
+# api.<domain> through Traefik with a Let's Encrypt certificate (MVP done-when #4).
+# Until the DNS record exists, cert-manager cannot complete the HTTP-01 challenge
+# and the route serves Traefik's default (self-signed) certificate.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: dsh-api
+  namespace: dsh-api
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts: [api.dansserverhosting.com]
+      secretName: dsh-api-tls
+  rules:
+    - host: api.dansserverhosting.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: dsh-api
+                port:
+                  name: http

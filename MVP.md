@@ -23,11 +23,11 @@
 
 ## Done when
 
-1. With a valid UserAuth token, `POST /api/v1/servers` results in a server a player can join by hostname, and `GET` reports it `asleep` → `awake` as that happens.
-2. A second tenant cannot see or delete the first tenant's server.
-3. `DELETE` produces a backup file before the namespace goes.
-4. The API is reachable at `api.<domain>` through Traefik with a real certificate once the domain exists (self-signed before).
-5. Unit tests run without a cluster (the k8s/helm calls are behind one interface with a fake).
+1. [ ] With a valid UserAuth token, `POST /api/v1/servers` results in a server a player can join by hostname, and `GET` reports it `asleep` → `awake` as that happens. *Implemented and tested against the fake cluster; awaits the first deploy to be confirmed against the real one.*
+2. [x] A second tenant cannot see or delete the first tenant's server.
+3. [x] `DELETE` produces a backup file before the namespace goes. *Ordering verified against the fake; the `kubectl exec` / PVC-reader command lines are asserted, the real transfer awaits a deploy.*
+4. [ ] The API is reachable at `api.<domain>` through Traefik with a real certificate once the domain exists (self-signed before). *Manifests in `deploy/`; needs applying to the cluster.*
+5. [x] Unit tests run without a cluster (the k8s/helm calls are behind one interface with a fake).
 
 ## Not in the MVP
 

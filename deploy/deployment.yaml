@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dsh-api
+  namespace: dsh-api
+  labels:
+    app.kubernetes.io/name: dsh-api
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # one SQLite writer, one PVC
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dsh-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: dsh-api
+    spec:
+      serviceAccountName: dsh-api
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: ghcr.io/dans-server-hosting/dsh-api:latest
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: dsh-api
+            - secretRef:
+                name: dsh-api
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 30
+          volumeMounts:
+            - name: state
+              mountPath: /data
+            - name: backups
+              mountPath: /backups
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: dsh-api-state
+        - name: backups
+          persistentVolumeClaim:
+            claimName: dsh-api-backups
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dsh-api
+  namespace: dsh-api
+spec:
+  selector:
+    app.kubernetes.io/name: dsh-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

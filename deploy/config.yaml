@@ -1,0 +1,25 @@
+# Non-secret configuration. Replace the placeholder values before applying.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dsh-api
+  namespace: dsh-api
+data:
+  DSH_BASE_DOMAIN: "dansserverhosting.com"
+  DSH_NODE_IP: "203.0.113.10" # the node's public address, for <name>.<ip-dashed>.sslip.io
+  DSH_MAX_SERVERS_PER_TENANT: "1"
+  DSH_DB_PATH: /data/dsh-api.db
+  DSH_BACKUP_DIR: /backups
+  OMCSI_CHART_DIR: /opt/omcsi
+---
+# The UserAuth signing secret. Create it out of band, never from a committed file:
+#   kubectl -n dsh-api create secret generic dsh-api --from-literal=USERAUTH_JWT_SECRET=...
+# This stub only documents the shape.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dsh-api
+  namespace: dsh-api
+type: Opaque
+stringData:
+  USERAUTH_JWT_SECRET: REPLACE_ME
