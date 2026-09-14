@@ -1,5 +1,6 @@
 """Every handler against the fake cluster."""
 
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -8,6 +9,7 @@ from fastapi.testclient import TestClient
 from dsh_api.auth import FakeValidator
 from dsh_api.cluster import Credentials, ReleaseSpec, StatefulSetStatus, WrapperStatus
 from dsh_api.config import DEFAULT_PLUGINS, Settings
+from dsh_api.db import Database
 from dsh_api.main import create_app
 from dsh_api.service import STATES, WAKE_GRACE, server_state
 
@@ -23,10 +25,16 @@ def test_create_provisions_like_the_operator_script(client, cluster, created):
     assert created["sslip_hostname"] == "alpha.203-0-113-10.sslip.io"
     assert created["dashboard_url"] == "https://alpha.play.example.com/"
     assert created["motd"] == "alpha on Dan's Server Hosting"
-    assert created["state"] == "awake"  # woken after install, rollouts waited for
-    assert created["last_woken_at"]
+    assert created["state"] == "provisioning"  # the 202: the cluster work is still ahead
+    assert created["last_woken_at"] is None
+    assert created["players_online"] is None
     assert created["admin_username"] == "admin"
     assert created["admin_password"] == cluster.credentials["alpha"].admin_password
+
+    # The job has run (the fixture ran it): woken after install, rollouts waited for.
+    after = client.get("/api/v1/servers/alpha", headers=ALICE).json()
+    assert after["state"] == "awake"
+    assert after["last_woken_at"]
 
     assert cluster.ops == [
         ("create_tenant_namespace", "alpha"),
@@ -45,7 +53,7 @@ def test_create_provisions_like_the_operator_script(client, cluster, created):
     )
 
 
-def test_create_passes_the_configured_default_plugins(settings, db, cluster, resolver):
+def test_create_passes_the_configured_default_plugins(settings, db, cluster, resolver, jobs):
     settings = Settings(
         **{**vars(settings), "default_plugins": ("https://a/x.jar", "https://b/y.jar")}
     )
@@ -55,19 +63,23 @@ def test_create_passes_the_configured_default_plugins(settings, db, cluster, res
         cluster=cluster,
         validator=FakeValidator({"alice-token": "alice"}),
         uuids=resolver,
+        jobs=jobs,
     )
     resp = TestClient(app).post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE)
-    assert resp.status_code == 201, resp.text
+    assert resp.status_code == 202, resp.text
+    assert cluster.ops == []  # nothing has happened yet: the job is queued
+    assert jobs.run() == 1
     assert cluster.releases["alpha"].default_plugins == ("https://a/x.jar", "https://b/y.jar")
 
 
-def test_create_honours_motd_and_operator(client, cluster):
+def test_create_honours_motd_and_operator(client, cluster, jobs):
     resp = client.post(
         "/api/v1/servers",
         json={"name": "beta", "motd": "hello", "operator_username": "Steve"},
         headers=ALICE,
     )
-    assert resp.status_code == 201, resp.text
+    assert resp.status_code == 202, resp.text
+    jobs.run()
     spec = cluster.releases["beta"]
     assert spec.motd == "hello"
     assert spec.operator_name == "Steve"
@@ -75,12 +87,12 @@ def test_create_honours_motd_and_operator(client, cluster):
     assert resp.json()["operator_username"] == "Steve"
 
 
-def test_create_with_unknown_operator_is_422_and_provisions_nothing(client, cluster):
+def test_create_with_unknown_operator_is_422_and_provisions_nothing(client, cluster, jobs):
     resp = client.post(
         "/api/v1/servers", json={"name": "beta", "operator_username": "Nobody"}, headers=ALICE
     )
     assert resp.status_code == 422
-    assert cluster.ops == []
+    assert jobs.pending == [] and cluster.ops == []
     assert client.get("/api/v1/servers", headers=ALICE).json() == []
 
 
@@ -113,6 +125,187 @@ def test_tenant_at_cap_is_403(client, created):
     assert "cap" in resp.json()["detail"]
 
 
+# --- create, asynchronously ----------------------------------------------------
+
+
+def test_create_answers_202_and_provisions_in_the_background(client, cluster, jobs, db):
+    resp = client.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE)
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["state"] == "provisioning"
+    assert resp.json()["admin_password"]
+    # Nothing has touched the cluster yet; the row is reserved and the job queued.
+    assert cluster.ops == []
+    assert "t-alpha" not in cluster.namespaces
+    assert len(jobs.pending) == 1
+    assert [e["kind"] for e in db.events("alpha")] == ["create.requested"]
+    # Reads report the row's state without asking a cluster that has nothing yet.
+    assert client.get("/api/v1/servers/alpha", headers=ALICE).json()["state"] == "provisioning"
+    listed = client.get("/api/v1/servers", headers=ALICE).json()
+    assert [(s["name"], s["state"]) for s in listed] == [("alpha", "provisioning")]
+
+    assert jobs.run() == 1
+    assert [op[0] for op in cluster.ops] == [
+        "create_tenant_namespace",
+        "create_credentials",
+        "install_release",
+        "scale_wrapper",
+        "wait_for_rollout",
+    ]
+    body = client.get("/api/v1/servers/alpha", headers=ALICE).json()
+    assert body["state"] == "awake"
+    assert body["last_woken_at"]
+    assert [e["kind"] for e in db.events("alpha")] == ["create.requested", "create.done"]
+
+
+def test_second_create_while_provisioning_is_409_not_the_cap(client, cluster, jobs):
+    first = client.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE)
+    assert first.status_code == 202
+    resp = client.post("/api/v1/servers", json={"name": "second"}, headers=ALICE)
+    assert resp.status_code == 409, resp.text
+    assert resp.json() == {
+        "detail": "a server is already being created for this account",
+        "server": "alpha",
+    }
+    # The same name again is the same answer: the create in flight is the one that counts.
+    assert client.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE).status_code == 409
+    assert len(jobs.pending) == 1  # nothing extra was queued
+    # Another tenant is unaffected.
+    assert client.post("/api/v1/servers", json={"name": "bobs"}, headers=BOB).status_code == 202
+    # Once the job has run the answer is the ordinary cap.
+    jobs.run()
+    resp = client.post("/api/v1/servers", json={"name": "second"}, headers=ALICE)
+    assert resp.status_code == 403
+    assert "cap" in resp.json()["detail"]
+
+
+def test_wake_and_delete_while_provisioning(client, cluster, jobs):
+    assert client.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE).status_code == 202
+    # Wake has nothing to scale yet: it answers with the row and touches nothing.
+    resp = client.post("/api/v1/servers/alpha/wake", headers=ALICE)
+    assert resp.status_code == 202 and resp.json()["state"] == "provisioning"
+    # Delete would race the job that is still writing to the server.
+    resp = client.delete("/api/v1/servers/alpha", headers=ALICE)
+    assert resp.status_code == 409
+    assert "still being created" in resp.json()["detail"]
+    assert cluster.ops == []
+    jobs.run()
+    assert client.get("/api/v1/servers/alpha", headers=ALICE).json()["state"] == "awake"
+
+
+@pytest.mark.parametrize("step", ["install_release", "wait_for_rollout"])
+def test_create_failure_is_reported_as_failed_and_recorded(client, cluster, jobs, db, step):
+    cluster.fail_on.add(step)
+    resp = client.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE)
+    assert resp.status_code == 202  # the failure is still ahead
+    jobs.run()
+    events = db.events("alpha")
+    assert [e["kind"] for e in events] == ["create.requested", "create.failed"]
+    assert step in events[-1]["detail"]
+    # The row stays (holding the slot) so the tenant can see what became of it
+    # and remove it; whatever the cluster says, the create failed.
+    assert client.get("/api/v1/servers/alpha", headers=ALICE).json()["state"] == "failed"
+    assert client.get("/api/v1/servers", headers=ALICE).json()[0]["state"] == "failed"
+    assert client.post("/api/v1/servers", json={"name": "second"}, headers=ALICE).status_code == 403
+    # Nothing was torn down: the namespace is there for the operator to inspect.
+    assert "t-alpha" in cluster.namespaces
+    assert "uninstall_release" not in [op[0] for op in cluster.ops]
+
+
+def test_an_unexpected_error_in_the_job_is_a_failed_create_too(client, cluster, jobs, db):
+    def boom(name):
+        raise RuntimeError("kubectl vanished")
+
+    cluster.wait_for_rollout = boom  # type: ignore[method-assign]
+    assert client.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE).status_code == 202
+    jobs.run()  # does not raise: the thread must not die with the row left provisioning
+    assert client.get("/api/v1/servers/alpha", headers=ALICE).json()["state"] == "failed"
+    assert db.events("alpha")[-1]["detail"] == "RuntimeError: kubectl vanished"
+
+
+def test_wake_of_a_failed_create_touches_nothing(client, cluster, jobs):
+    cluster.fail_on.add("install_release")
+    client.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE)
+    jobs.run()
+    n_ops = len(cluster.ops)
+    resp = client.post("/api/v1/servers/alpha/wake", headers=ALICE)
+    assert resp.status_code == 202 and resp.json()["state"] == "failed"
+    assert len(cluster.ops) == n_ops
+
+
+@pytest.mark.parametrize("step", ["install_release", "wait_for_rollout"])
+def test_delete_of_a_failed_create_frees_the_slot(client, cluster, jobs, db, step):
+    cluster.fail_on.add(step)
+    client.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE)
+    jobs.run()
+    resp = client.delete("/api/v1/servers/alpha", headers=ALICE)
+    assert resp.status_code == 200, resp.text
+    kinds = [e["kind"] for e in db.events("alpha")]
+    if step == "install_release":
+        # No release, so no world volume: the backup is skipped, not fatal.
+        assert resp.json()["backup"] is None
+        assert "backup.skipped" in kinds
+    else:
+        assert resp.json()["backup"]
+        assert "backup" in kinds
+    assert [op[0] for op in cluster.ops[-2:]] == ["uninstall_release", "delete_namespace"]
+    assert "t-alpha" not in cluster.namespaces
+    assert client.get("/api/v1/servers/alpha", headers=ALICE).status_code == 404
+    # The slot is free again, and the name too.
+    assert client.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE).status_code == 202
+
+
+def test_provisioning_left_over_by_a_restart_is_marked_failed(settings, cluster, resolver, jobs):
+    db = Database(settings.db_path)
+    db.ensure_tenant("alice")
+    db.insert_server("alpha", "alice", "alpha.play.example.com", "m", None, status="provisioning")
+    validator = FakeValidator({"alice-token": "alice"})
+    app = create_app(
+        settings, db=db, cluster=cluster, validator=validator, uuids=resolver, jobs=jobs
+    )
+    client = TestClient(app)
+    body = client.get("/api/v1/servers/alpha", headers=ALICE).json()
+    assert body["state"] == "failed"
+    assert db.events("alpha")[-1]["kind"] == "create.interrupted"
+    # ... and the tenant is not stuck: the failed server can be removed.
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 200
+
+
+def test_create_runs_on_a_real_thread_pool_by_default(settings, db, cluster, resolver):
+    """Without an injected runner the app's own executor does the work."""
+    app = create_app(
+        settings,
+        db=db,
+        cluster=cluster,
+        validator=FakeValidator({"alice-token": "alice"}),
+        uuids=resolver,
+    )
+    client = TestClient(app)
+    resp = client.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE)
+    assert resp.status_code == 202
+    deadline = time.monotonic() + 10
+    while client.get("/api/v1/servers/alpha", headers=ALICE).json()["state"] == "provisioning":
+        assert time.monotonic() < deadline, "the background job never finished"
+        time.sleep(0.02)
+    assert client.get("/api/v1/servers/alpha", headers=ALICE).json()["state"] == "awake"
+    app.state.jobs.shutdown(wait=True)
+
+
+def test_an_old_database_gains_the_status_column(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            "CREATE TABLE servers (name TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,"
+            " hostname TEXT NOT NULL, motd TEXT NOT NULL, operator_username TEXT,"
+            " created_at TEXT NOT NULL, last_woken_at TEXT);"
+            "INSERT INTO servers VALUES ('alpha', 'alice', 'h', 'm', NULL, 't', NULL);"
+        )
+    db = Database(str(path))
+    assert db.get_server("alpha").status == "ready"  # existing servers are done
+    Database(str(path))  # idempotent
+
+
 def test_admin_password_is_returned_exactly_once(client, created):
     assert "admin_password" in created
     one = client.get("/api/v1/servers/alpha", headers=ALICE).json()
@@ -122,20 +315,6 @@ def test_admin_password_is_returned_exactly_once(client, created):
     dumped = (one | many[0]).values()
     creds = Credentials.generate()
     assert creds.rcon_password not in dumped
-
-
-@pytest.mark.parametrize(
-    "step, state_after", [("install_release", "failed"), ("wait_for_rollout", "waking")]
-)
-def test_create_failure_is_502_and_recorded(client, cluster, db, step, state_after):
-    cluster.fail_on.add(step)
-    resp = client.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE)
-    assert resp.status_code == 502
-    assert step in resp.json()["detail"]
-    kinds = [e["kind"] for e in db.events("alpha")]
-    assert kinds == ["create.requested", "create.failed"]
-    # The row stays so the tenant can see what became of it and remove it.
-    assert client.get("/api/v1/servers/alpha", headers=ALICE).json()["state"] == state_after
 
 
 # --- read ------------------------------------------------------------------
@@ -284,9 +463,10 @@ def test_a_second_tenant_cannot_see_wake_or_delete_the_first_tenants_server(
     assert [op[0] for op in cluster.ops if op[0] in ("backup_world", "uninstall_release")] == []
 
 
-def test_each_tenant_sees_only_their_own(client, settings, created):
+def test_each_tenant_sees_only_their_own(client, settings, created, jobs):
     resp = client.post("/api/v1/servers", json={"name": "bobs"}, headers=BOB)
-    assert resp.status_code == 201
+    assert resp.status_code == 202
+    jobs.run()
     assert [s["name"] for s in client.get("/api/v1/servers", headers=ALICE).json()] == ["alpha"]
     assert [s["name"] for s in client.get("/api/v1/servers", headers=BOB).json()] == ["bobs"]
 
@@ -296,7 +476,7 @@ def test_each_tenant_sees_only_their_own(client, settings, created):
 
 def test_wake_scales_the_wrapper_to_one(client, cluster, created):
     cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
-    before = created["last_woken_at"]
+    before = client.get("/api/v1/servers/alpha", headers=ALICE).json()["last_woken_at"]
     resp = client.post("/api/v1/servers/alpha/wake", headers=ALICE)
     assert resp.status_code == 202
     assert resp.json()["state"] == "waking"
@@ -316,7 +496,7 @@ def test_wake_when_already_up_does_nothing(client, cluster, created):
 def test_wake_of_a_stopped_server_starts_the_game_in_place(client, cluster, created, db):
     """The observed case: Stop was pressed in the dashboard, the pod stayed Ready."""
     cluster.stop_game("alpha")
-    before = created["last_woken_at"]
+    before = client.get("/api/v1/servers/alpha", headers=ALICE).json()["last_woken_at"]
     n_ops = len(cluster.ops)
     resp = client.post("/api/v1/servers/alpha/wake", headers=ALICE)
     assert resp.status_code == 202, resp.text
@@ -443,7 +623,7 @@ def test_force_delete_tolerates_an_impossible_backup(client, cluster, created, d
 def test_after_delete_the_name_can_be_reused(client, cluster, created):
     cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
     assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 200
-    assert client.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE).status_code == 201
+    assert client.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE).status_code == 202
 
 
 @pytest.mark.parametrize("motd", ["a,b", "k=v", "x[0]", "{y}", "back\\slash", "tab\there"])

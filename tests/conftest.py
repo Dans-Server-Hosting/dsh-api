@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,37 @@ from dsh_api.config import Settings
 from dsh_api.db import Database
 from dsh_api.main import create_app
 from dsh_api.mojang import FakeResolver
+
+
+class ManualJobs:
+    """A ``JobRunner`` that queues provisioning jobs and runs them on demand.
+
+    The app's real one is a thread pool; here the test decides when the
+    background work happens, so the in-between (``provisioning``) can be
+    observed and the outcome asserted without sleeping.
+    """
+
+    def __init__(self) -> None:
+        self.pending: list[tuple[Callable[..., object], tuple[object, ...]]] = []
+        self.ran = 0
+
+    def submit(self, fn: Callable[..., object], /, *args: object) -> None:
+        self.pending.append((fn, args))
+
+    def run(self) -> int:
+        """Run everything queued (in order); returns how many jobs ran."""
+        ran = 0
+        while self.pending:
+            fn, args = self.pending.pop(0)
+            fn(*args)
+            ran += 1
+        self.ran += ran
+        return ran
+
+
+@pytest.fixture
+def jobs() -> ManualJobs:
+    return ManualJobs()
 
 
 @pytest.fixture
@@ -40,7 +72,7 @@ def resolver() -> FakeResolver:
 
 
 @pytest.fixture
-def client(settings, db, cluster, resolver) -> TestClient:
+def client(settings, db, cluster, resolver, jobs) -> TestClient:
     app = create_app(
         settings,
         db=db,
@@ -49,15 +81,22 @@ def client(settings, db, cluster, resolver) -> TestClient:
             {"alice-token": "alice", "bob-token": "bob", "admin-token": "admin"}
         ),
         uuids=resolver,
+        jobs=jobs,
     )
     return TestClient(app)
 
 
 @pytest.fixture
-def created(client: TestClient) -> dict:
-    """A server named ``alpha`` owned by alice, freshly provisioned."""
+def created(client: TestClient, jobs: ManualJobs) -> dict:
+    """A server named ``alpha`` owned by alice, provisioned to completion.
+
+    The body is the 202 (state ``provisioning``, with the one-time admin
+    password); the provisioning job has then been run, so a ``GET`` sees it
+    ``awake``.
+    """
     resp = client.post(
         "/api/v1/servers", json={"name": "alpha"}, headers={"Authorization": "Bearer alice-token"}
     )
-    assert resp.status_code == 201, resp.text
+    assert resp.status_code == 202, resp.text
+    assert jobs.run() == 1
     return resp.json()

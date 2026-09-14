@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Protocol
 
 from dsh_api.cluster import (
     ClusterBackend,
@@ -18,9 +21,11 @@ from dsh_api.config import Settings
 from dsh_api.db import Database, ServerRow
 from dsh_api.mojang import UuidResolver
 
+log = logging.getLogger(__name__)
+
 NAME_PATTERN = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
 
-STATES = ("asleep", "waking", "awake", "stopped", "failed")
+STATES = ("provisioning", "asleep", "waking", "awake", "stopped", "failed")
 
 WAKE_GRACE = timedelta(minutes=3)
 """How long after a scale-up a not-yet-running game still counts as waking."""
@@ -60,8 +65,26 @@ def validate_name(name: str) -> str:
     return name
 
 
+class JobRunner(Protocol):
+    """Where the provisioning steps run after ``POST`` has answered.
+
+    ``concurrent.futures.ThreadPoolExecutor`` is the real one; the tests pass
+    one that queues the job and runs it when they say so.
+    """
+
+    def submit(self, fn: Callable[..., object], /, *args: object) -> object: ...
+
+
 class NameTaken(Exception):
     pass
+
+
+class CreateInProgress(Exception):
+    """The tenant already has a create in flight (or the server asked about is it)."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(f"a server is already being created: {name}")
+        self.name = name
 
 
 class TenantAtCap(Exception):
@@ -94,12 +117,29 @@ class ServerView:
 
 class ServerService:
     def __init__(
-        self, settings: Settings, db: Database, cluster: ClusterBackend, uuids: UuidResolver
+        self,
+        settings: Settings,
+        db: Database,
+        cluster: ClusterBackend,
+        uuids: UuidResolver,
+        jobs: JobRunner,
     ) -> None:
         self.settings = settings
         self.db = db
         self.cluster = cluster
         self.uuids = uuids
+        self.jobs = jobs
+
+    def recover_interrupted(self) -> None:
+        """Rows left ``provisioning`` by a process that died mid-create.
+
+        The job ran in this process, so nothing is still working on them: they
+        are marked failed (the namespace and release stay for inspection) so the
+        tenant can see what happened and DELETE to free the slot.
+        """
+        for row in self.db.list_provisioning():
+            self.db.set_status(row.name, "failed")
+            self.db.record(row.tenant_id, row.name, "create.interrupted", "the API restarted")
 
     # --- reads ---------------------------------------------------------------
 
@@ -109,7 +149,10 @@ class ServerService:
         return server_state(sts, wrapper)
 
     def _view(self, row: ServerRow, with_players: bool) -> ServerView:
-        state = self._state(row.name)
+        # While the create is in flight, or after it failed, the row is the
+        # answer: the release may not exist yet, and a failed one stays failed
+        # until it is removed, whatever the cluster would say about it.
+        state = row.status if row.status != "ready" else self._state(row.name)
         players = (
             self.cluster.players_online(row.name) if with_players and state == "awake" else None
         )
@@ -143,7 +186,16 @@ class ServerService:
     def create(
         self, tenant_id: str, name: str, motd: str | None, operator_username: str | None
     ) -> tuple[ServerView, str]:
-        """Provision a server; returns the view and the one-time admin password."""
+        """Reserve the server and start provisioning it; returns the view (state
+        ``provisioning``) and the one-time admin password.
+
+        The cluster steps take minutes, so they run on ``jobs`` after this
+        returns; ``get``/``list`` report ``provisioning`` from the row until
+        the job has moved it on.
+        """
+        pending = self.db.provisioning_server(tenant_id)
+        if pending is not None:
+            raise CreateInProgress(pending.name)
         if self.db.count_servers(tenant_id) >= self.settings.max_servers_per_tenant:
             raise TenantAtCap(tenant_id)
         if self.db.get_server(name) is not None or self.cluster.namespace_exists(name):
@@ -160,8 +212,18 @@ class ServerService:
             default_plugins=self.settings.default_plugins,
         )
         creds = Credentials.generate()
-        row = self.db.insert_server(name, tenant_id, spec.hostname, motd, operator_username)
+        row = self.db.insert_server(
+            name, tenant_id, spec.hostname, motd, operator_username, status="provisioning"
+        )
         self.db.record(tenant_id, name, "create.requested")
+        self.jobs.submit(self._provision, tenant_id, spec, creds)
+        return self._view(row, with_players=False), creds.admin_password
+
+    def _provision(self, tenant_id: str, spec: ReleaseSpec, creds: Credentials) -> None:
+        """The cluster steps, off the request thread. Never raises: the outcome
+        is written to the row and the event log, which is where the tenant
+        (and the operator) read it from."""
+        name = spec.name
         try:
             self.cluster.create_tenant_namespace(name)
             self.cluster.create_credentials(name, creds)
@@ -172,11 +234,21 @@ class ServerService:
             self.cluster.scale_wrapper(name, 1)
             self.cluster.wait_for_rollout(name)
         except ClusterError as exc:
-            self.db.record(tenant_id, name, "create.failed", str(exc))
-            raise
+            self._provision_failed(tenant_id, name, str(exc))
+            return
+        except Exception as exc:  # the thread must not die silently
+            log.exception("provisioning %s failed unexpectedly", name)
+            self._provision_failed(tenant_id, name, f"{type(exc).__name__}: {exc}")
+            return
         self.db.mark_woken(name)
+        self.db.set_status(name, "ready")
         self.db.record(tenant_id, name, "create.done")
-        return self._view(self.db.get_server(name) or row, with_players=False), creds.admin_password
+
+    def _provision_failed(self, tenant_id: str, name: str, detail: str) -> None:
+        # The namespace and release are left as they are for inspection; the
+        # tenant's slot is held until they DELETE the failed server.
+        self.db.set_status(name, "failed")
+        self.db.record(tenant_id, name, "create.failed", detail)
 
     def wake(self, tenant_id: str, name: str) -> ServerView:
         """Scale an asleep wrapper up, or start the game on a stopped one.
@@ -185,6 +257,9 @@ class ServerService:
         crash-looping pod does nothing useful; the failure is reported instead).
         """
         row = self._owned(tenant_id, name)
+        if row.status != "ready":
+            # Still being created, or the create failed: nothing to scale yet.
+            return self._view(row, with_players=False)
         sts = self.cluster.statefulset_status(name)
         if sts.replicas < 1:
             self.cluster.scale_wrapper(name, 1)
@@ -197,8 +272,16 @@ class ServerService:
         return self._view(self.db.get_server(name) or row, with_players=False)
 
     def delete(self, tenant_id: str, name: str, force: bool = False) -> str | None:
-        """Back up, uninstall, remove the namespace. Returns the backup path."""
-        self._owned(tenant_id, name)
+        """Back up, uninstall, remove the namespace. Returns the backup path.
+
+        A server whose create is still in flight cannot be removed (the job is
+        still writing to it); one whose create failed can, and since it may
+        never have had a pod or a volume, a backup that cannot be taken is
+        skipped rather than fatal — as it is with ``force``.
+        """
+        row = self._owned(tenant_id, name)
+        if row.status == "provisioning":
+            raise CreateInProgress(name)
         # The pod being up is what decides how the world is read (exec versus a
         # PVC reader); a stopped game still has its pod.
         awake = self.cluster.statefulset_status(name).state == "awake"
@@ -211,9 +294,10 @@ class ServerService:
             backup = str(self.cluster.backup_world(name, awake=awake))
             self.db.record(tenant_id, name, "backup", backup)
         except ClusterError as exc:
-            # Without force the world is never removed unbacked-up. With force
-            # (a release that never installed has nothing to read) it may be.
-            if not force:
+            # Without force the world is never removed unbacked-up. With force,
+            # or for a failed create (a release that never installed has
+            # nothing to read), it may be.
+            if not force and row.status != "failed":
                 raise
             backup = None
             self.db.record(tenant_id, name, "backup.skipped", str(exc))

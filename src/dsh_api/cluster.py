@@ -520,8 +520,15 @@ class KubectlHelmBackend:
         path = self.backup_dir / f"{name}-{stamp}.tar.gz"
         tar = ["tar", "-C", "/mcserver", "-czf", "-", "."]
         if awake:
+            # A missing pod makes this fail at once (NotFound), as it should.
             argv = ["kubectl", "-n", ns, "exec", f"{name}{WRAPPER_STS_SUFFIX}-0", "--", *tar]
         else:
+            # The reader pod would sit Pending until kubectl gave up if the
+            # claim did not exist (a create that failed before helm ran), so
+            # the claim is looked up first and its absence is the error.
+            self._run(
+                ["kubectl", "-n", ns, "get", "pvc", f"{name}{WRAPPER_PVC_SUFFIX}", "-o", "name"]
+            )
             overrides = {
                 "spec": {
                     "containers": [
@@ -645,6 +652,9 @@ class FakeClusterBackend:
         self._op("backup_world", name, awake)
         if namespace_for(name) not in self.namespaces:
             raise ClusterError("no such namespace")
+        if name not in self.releases:
+            # No release, no world volume: the real backend finds no PVC (or no pod).
+            raise ClusterError(f"persistentvolumeclaims {name}{WRAPPER_PVC_SUFFIX} not found")
         self.backup_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         path = self.backup_dir / f"{name}-{stamp}.tar.gz"
