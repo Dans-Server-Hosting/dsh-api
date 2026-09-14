@@ -24,10 +24,27 @@ what remains (see the MVP done-when list).
 - State is one SQLite file: `tenants`, `servers` (who owns what), `events` and
   `feedback` (what signed-in people said about the portal, for the admins).
   The cluster stays the source of truth for whether a server exists and what
-  state it is in (`asleep | waking | awake | failed`, read from the wrapper
-  StatefulSet).
+  state it is in: the wrapper StatefulSet says whether the pod is up, and the
+  wrapper's own API (`/api/server/status` on its internal Service, port 8092)
+  says whether the game process is running inside it.
 - The player count comes from the game server's own status handshake
   (server list ping) against the wrapper Service inside the cluster.
+
+### Server states
+
+| `state` | StatefulSet | Wrapper says | Meaning |
+|---|---|---|---|
+| `asleep` | 0 replicas | *(not asked)* | scaled down by the router or never woken; `wake` scales it up |
+| `waking` | 1 replica, pod not Ready — or Ready with `running: false` less than 3 minutes after the scale-up | booting | the pod or the game is still coming up |
+| `awake` | 1 replica, pod Ready | `running: true` | joinable; `players_online` is reported on `GET /api/v1/servers/{name}` |
+| `stopped` | 1 replica, pod Ready | `running: false` | the game process exited (Stop in the dashboard, or a crash) while the pod stayed up; `wake` starts it in place |
+| `failed` | missing, or a pod in `CrashLoopBackOff` / `ImagePullBackOff` / `Failed` | *(not asked)* | needs the operator |
+
+The pod's readiness probe is the wrapper's Spring health, not the game's, so
+readiness alone cannot tell `awake` from `stopped`. When the wrapper cannot be
+asked (connection refused, timeout, non-200) the replica-based reading stands:
+Ready is `awake`, not Ready is `waking`. A slow or missing wrapper answer
+never fails a list or get.
 
 ## Endpoints
 
@@ -37,8 +54,8 @@ what remains (see the MVP done-when list).
 | `GET` | `/api/v1/limits` | free-tier profile as numbers; no token needed |
 | `GET` | `/api/v1/servers` | the caller's servers |
 | `POST` | `/api/v1/servers` | `{name, motd?, operator_username?}` → 201; the admin password is in this response **only** |
-| `GET` | `/api/v1/servers/{name}` | one server, with `players_online` when awake |
-| `POST` | `/api/v1/servers/{name}/wake` | scales the wrapper to 1 |
+| `GET` | `/api/v1/servers/{name}` | one server, with `players_online` when `awake` (`null` otherwise) |
+| `POST` | `/api/v1/servers/{name}/wake` | 202 with the resulting server: `asleep` → scales the wrapper to 1; `stopped` → `POST /api/server/start` on the wrapper; `waking`/`awake` → no-op |
 | `DELETE` | `/api/v1/servers/{name}` | backup, `helm uninstall`, namespace delete; 409 while players are online unless `?force=true` |
 | `GET` | `/api/v1/me` | `{username, is_admin}` for the caller; admins are the `DSH_ADMIN_USERS` logins |
 | `POST` | `/api/v1/feedback` | `{message (1–4000 chars), page?}` → 201; any signed-in user, at most 10 per user per hour (429) |

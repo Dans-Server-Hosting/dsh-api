@@ -7,6 +7,9 @@ import json
 import socket
 import struct
 import threading
+import time
+from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
@@ -16,9 +19,12 @@ from dsh_api.cluster import (
     Credentials,
     KubectlHelmBackend,
     ReleaseSpec,
+    WrapperStatus,
     helm_install_argv,
+    http_json,
     server_list_ping,
     tenant_namespace_manifests,
+    wrapper_api_url,
 )
 
 CREDS = Credentials(
@@ -226,17 +232,18 @@ def sts(replicas, ready):
     return json.dumps({"spec": {"replicas": replicas}, "status": {"readyReplicas": ready}})
 
 
-def pods(*reasons, phase="Running"):
+def pods(*reasons, phase="Running", created="2026-09-13T10:00:00Z"):
     return json.dumps(
         {
             "items": [
                 {
+                    "metadata": {"creationTimestamp": created},
                     "status": {
                         "phase": phase,
                         "containerStatuses": [
                             {"state": {"waiting": {"reason": r}}} for r in reasons
                         ],
-                    }
+                    },
                 }
             ]
         }
@@ -254,12 +261,153 @@ def pods(*reasons, phase="Running"):
         ([sts(1, 1), pods(phase="Failed")], "failed"),
     ],
 )
-def test_wrapper_status_reads_the_statefulset(tmp_path, answers, expected):
+def test_statefulset_status_reads_the_statefulset(tmp_path, answers, expected):
     runner = Runner(*answers)
     be = KubectlHelmBackend("/opt/omcsi", str(tmp_path), run=runner)
-    assert be.wrapper_status("alpha").state == expected
+    assert be.statefulset_status("alpha").state == expected
     assert runner.calls[0][0][:6] == ["kubectl", "-n", "t-alpha", "get", "statefulset",
                                       "alpha-omcsi-minecraft-wrapper"]  # fmt: skip
+
+
+def test_statefulset_status_carries_the_pod_creation_time_as_scaled_at(tmp_path):
+    """Scaling to zero deletes the pod, so its creation time is the last scale-up."""
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path), run=Runner(sts(1, 1), pods()))
+    status = be.statefulset_status("alpha")
+    assert status.scaled_at == datetime(2026, 9, 13, 10, 0, tzinfo=UTC)
+    # Asleep: no pod to read, and no second kubectl call.
+    runner = Runner(sts(0, 0))
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path), run=runner)
+    assert be.statefulset_status("alpha").scaled_at is None
+    assert len(runner.calls) == 1
+    # A pod without a usable timestamp leaves it unset rather than failing.
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path), run=Runner(sts(1, 1), pods(created="")))
+    assert be.statefulset_status("alpha").scaled_at is None
+
+
+# --- the wrapper's own API ----------------------------------------------------
+
+
+class Http:
+    """Records (url, method, timeout); answers from a queue like ``Runner``."""
+
+    def __init__(self, *answers):
+        self.calls = []
+        self.answers = list(answers)
+
+    def __call__(self, url, method="GET", timeout=3.0):
+        self.calls.append((url, method, timeout))
+        return self.answers.pop(0) if self.answers else None
+
+
+def test_wrapper_api_url_is_the_internal_service_in_the_tenant_namespace():
+    assert wrapper_api_url("alpha", "/api/server/status") == (
+        "http://alpha-omcsi-minecraft-wrapper-internal.t-alpha.svc.cluster.local:8092"
+        "/api/server/status"
+    )
+
+
+def test_wrapper_status_gets_the_status_endpoint(tmp_path):
+    http = Http((200, {"running": True, "pid": 42, "uptimeSeconds": 900, "startedAt": "t0"}))
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path), http=http)
+    assert be.wrapper_status("alpha") == WrapperStatus(
+        running=True, pid=42, uptime_seconds=900, started_at="t0"
+    )
+    assert http.calls == [(wrapper_api_url("alpha", "/api/server/status"), "GET", 3.0)]
+
+
+def test_wrapper_status_reports_a_stopped_game(tmp_path):
+    http = Http((200, {"running": False, "pid": None, "uptimeSeconds": 0, "startedAt": None}))
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path), http=http)
+    assert be.wrapper_status("alpha") == WrapperStatus(running=False, uptime_seconds=0)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        None,  # unreachable: refused, unresolvable or timed out
+        (503, {"status": "DOWN"}),  # not 200
+        (200, "not json"),  # 200 but not the status document
+        (200, {"pid": 1}),  # no ``running`` field
+        (200, {"running": "yes"}),  # wrong type
+    ],
+)
+def test_wrapper_status_is_none_unless_the_wrapper_answers_properly(tmp_path, answer):
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path), http=Http(answer))
+    assert be.wrapper_status("alpha") is None
+
+
+def test_start_wrapper_posts_to_the_start_endpoint(tmp_path):
+    http = Http((200, {"running": True}))
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path), http=http)
+    be.start_wrapper("alpha")
+    assert http.calls == [(wrapper_api_url("alpha", "/api/server/start"), "POST", 3.0)]
+
+
+@pytest.mark.parametrize("answer, match", [(None, "could not be reached"), ((409, {}), "409")])
+def test_start_wrapper_failure_is_a_cluster_error(tmp_path, answer, match):
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path), http=Http(answer))
+    with pytest.raises(ClusterError, match=match):
+        be.start_wrapper("alpha")
+
+
+def fake_wrapper_api(routes: dict, delay: float = 0.0):
+    """A loopback HTTP server answering ``{(method, path): (status, body)}``."""
+    seen = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def _answer(self):
+            seen.append((self.command, self.path))
+            time.sleep(delay)
+            status, body = routes.get((self.command, self.path), (404, {"error": "no route"}))
+            payload = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        do_GET = do_POST = _answer
+
+        def log_message(self, *_):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{srv.server_port}", seen, srv
+
+
+def test_http_json_against_a_loopback_wrapper():
+    base, seen, srv = fake_wrapper_api(
+        {
+            ("GET", "/api/server/status"): (200, {"running": False, "pid": None}),
+            ("POST", "/api/server/start"): (200, {"running": True}),
+        }
+    )
+    try:
+        assert http_json(f"{base}/api/server/status") == (200, {"running": False, "pid": None})
+        assert http_json(f"{base}/api/server/start", method="POST") == (200, {"running": True})
+        assert http_json(f"{base}/nope") == (404, {"error": "no route"})
+        assert seen == [
+            ("GET", "/api/server/status"),
+            ("POST", "/api/server/start"),
+            ("GET", "/nope"),
+        ]
+    finally:
+        srv.shutdown()
+
+
+def test_http_json_is_none_on_timeout_or_refused_connection():
+    base, _, srv = fake_wrapper_api({("GET", "/slow"): (200, {})}, delay=1.0)
+    try:
+        started = time.monotonic()
+        assert http_json(f"{base}/slow", timeout=0.2) is None
+        assert time.monotonic() - started < 1.0  # the timeout, not the server, decided
+    finally:
+        srv.shutdown()
+    with socket.socket() as probe:  # a port nothing listens on
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    assert http_json(f"http://127.0.0.1:{port}/api/server/status", timeout=0.5) is None
 
 
 def test_backup_of_an_awake_server_execs_tar(tmp_path):

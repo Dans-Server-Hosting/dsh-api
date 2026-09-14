@@ -14,9 +14,9 @@
 | Method | Path | Does |
 |---|---|---|
 | `POST` | `/api/v1/servers` | `{name, motd?, operator_username?}` → provisions (namespace + quota + OMCSI release from the co-located profile). 201 with the server. 409 if the name is taken, 403 if the tenant is at cap. |
-| `GET` | `/api/v1/servers` | the caller's servers with `state: asleep|waking|awake|failed`, hostname, dashboard URL |
+| `GET` | `/api/v1/servers` | the caller's servers with `state: asleep|waking|awake|stopped|failed`, hostname, dashboard URL |
 | `GET` | `/api/v1/servers/{name}` | one server, plus last-woken and player count when awake |
-| `POST` | `/api/v1/servers/{name}/wake` | scales the wrapper to 1 (the panel's Start button) |
+| `POST` | `/api/v1/servers/{name}/wake` | scales the wrapper to 1, or starts the game in a pod that is up with the game stopped (the panel's Start button); 202 |
 | `DELETE` | `/api/v1/servers/{name}` | backs up the world, uninstalls, removes the namespace. 409 while players are online unless `?force=true` |
 | `GET` | `/api/v1/limits` | the free-tier profile as numbers, for the portal to display |
 | `GET` | `/healthz` | liveness |
@@ -28,6 +28,14 @@
 3. [x] `DELETE` produces a backup file before the namespace goes. *Ordering verified against the fake; the `kubectl exec` / PVC-reader command lines are asserted, the real transfer awaits a deploy.*
 4. [ ] The API is reachable at `api.<domain>` through Traefik with a real certificate once the domain exists (self-signed before). *Manifests in `deploy/`; needs applying to the cluster.*
 5. [x] Unit tests run without a cluster (the k8s/helm calls are behind one interface with a fake).
+
+*Since the MVP:* `state` is no longer read from the StatefulSet alone. The
+wrapper pod's readiness probe is the wrapper's own health, so a server whose
+owner pressed Stop in the dashboard stayed Ready and was reported `awake` for
+hours while nobody could join, and `wake` (replicas already 1) did nothing.
+The API now also asks the wrapper's `/api/server/status`; a Ready pod whose
+game is not running is `stopped`, and `wake` starts the game in place. See the
+state table in the README.
 
 ## Not in the MVP
 

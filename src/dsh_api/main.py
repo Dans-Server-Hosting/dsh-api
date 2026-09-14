@@ -131,7 +131,7 @@ def create_app(
         except ServerNotFound:
             raise HTTPException(404, "no such server") from None
 
-    @app.post("/api/v1/servers/{name}/wake")
+    @app.post("/api/v1/servers/{name}/wake", status_code=202)
     def wake_server(tenant: Tenant, name: str) -> dict:
         try:
             return asdict(service.wake(tenant, name))

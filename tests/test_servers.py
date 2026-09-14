@@ -1,12 +1,15 @@
 """Every handler against the fake cluster."""
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from fastapi.testclient import TestClient
 
 from dsh_api.auth import FakeValidator
-from dsh_api.cluster import Credentials, ReleaseSpec, WrapperStatus
+from dsh_api.cluster import Credentials, ReleaseSpec, StatefulSetStatus, WrapperStatus
 from dsh_api.config import DEFAULT_PLUGINS, Settings
 from dsh_api.main import create_app
+from dsh_api.service import STATES, WAKE_GRACE, server_state
 
 ALICE = {"Authorization": "Bearer alice-token"}
 BOB = {"Authorization": "Bearer bob-token"}
@@ -143,12 +146,12 @@ def test_list_and_get_report_state_transitions(client, cluster, created):
         return client.get("/api/v1/servers/alpha", headers=ALICE).json()["state"]
 
     assert state() == "awake"
-    cluster.wrappers["alpha"] = WrapperStatus(exists=True, replicas=1, ready_replicas=0)
+    cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=1, ready_replicas=0)
     assert state() == "waking"
     # The router puts the server to sleep when idle.
-    cluster.wrappers["alpha"] = WrapperStatus(exists=True, replicas=0)
+    cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
     assert state() == "asleep"
-    cluster.wrappers["alpha"] = WrapperStatus(exists=True, replicas=1, failing=True)
+    cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=1, failing=True)
     assert state() == "failed"
     cluster.wrappers.pop("alpha")
     assert state() == "failed"
@@ -160,7 +163,7 @@ def test_list_and_get_report_state_transitions(client, cluster, created):
 
 def test_get_includes_player_count_when_awake(client, cluster, created):
     cluster.players["alpha"] = 3
-    cluster.wrappers["alpha"] = WrapperStatus(exists=True, replicas=1, ready_replicas=0)
+    cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=1, ready_replicas=0)
     assert client.get("/api/v1/servers/alpha", headers=ALICE).json()["players_online"] is None
     cluster.become_ready("alpha")
     assert client.get("/api/v1/servers/alpha", headers=ALICE).json()["players_online"] == 3
@@ -168,12 +171,100 @@ def test_get_includes_player_count_when_awake(client, cluster, created):
     assert client.get("/api/v1/servers", headers=ALICE).json()[0]["players_online"] is None
 
 
-def test_wrapper_status_state_table():
-    assert WrapperStatus(exists=False).state == "failed"
-    assert WrapperStatus(exists=True, replicas=0).state == "asleep"
-    assert WrapperStatus(exists=True, replicas=1, ready_replicas=0).state == "waking"
-    assert WrapperStatus(exists=True, replicas=1, ready_replicas=1).state == "awake"
-    assert WrapperStatus(exists=True, replicas=1, ready_replicas=1, failing=True).state == "failed"
+def test_stopped_server_reports_no_player_count(client, cluster, created):
+    cluster.players["alpha"] = 3  # a stale ping answer must not leak through
+    cluster.stop_game("alpha")
+    body = client.get("/api/v1/servers/alpha", headers=ALICE).json()
+    assert body["state"] == "stopped"
+    assert body["players_online"] is None
+
+
+def test_statefulset_status_state_table():
+    assert StatefulSetStatus(exists=False).state == "failed"
+    assert StatefulSetStatus(exists=True, replicas=0).state == "asleep"
+    assert StatefulSetStatus(exists=True, replicas=1, ready_replicas=0).state == "waking"
+    assert StatefulSetStatus(exists=True, replicas=1, ready_replicas=1).state == "awake"
+    failing = StatefulSetStatus(exists=True, replicas=1, ready_replicas=1, failing=True)
+    assert failing.state == "failed"
+
+
+# --- state from the wrapper ---------------------------------------------------
+
+NOW = datetime(2026, 9, 13, 12, 0, tzinfo=UTC)
+LONG_AGO = NOW - timedelta(hours=2)
+JUST_NOW = NOW - WAKE_GRACE + timedelta(seconds=30)
+READY = StatefulSetStatus(exists=True, replicas=1, ready_replicas=1, scaled_at=LONG_AGO)
+NOT_READY = StatefulSetStatus(exists=True, replicas=1, ready_replicas=0, scaled_at=JUST_NOW)
+RUNNING = WrapperStatus(running=True, pid=7, uptime_seconds=60)
+STOPPED = WrapperStatus(running=False)
+
+
+@pytest.mark.parametrize(
+    "sts, wrapper, expected",
+    [
+        (READY, RUNNING, "awake"),
+        (READY, STOPPED, "stopped"),  # the observed case: pod Ready, game gone
+        (NOT_READY, RUNNING, "waking"),
+        (NOT_READY, STOPPED, "waking"),
+        (NOT_READY, None, "waking"),
+        (READY, None, "awake"),  # wrapper unreachable: replica-based reading stands
+        (StatefulSetStatus(exists=True, replicas=0), None, "asleep"),
+        (StatefulSetStatus(exists=True, replicas=0), STOPPED, "asleep"),
+        (StatefulSetStatus(exists=False), None, "failed"),
+        (StatefulSetStatus(exists=True, replicas=1, ready_replicas=1, failing=True), RUNNING,
+         "failed"),
+    ],
+)  # fmt: skip
+def test_server_state_table(sts, wrapper, expected):
+    assert server_state(sts, wrapper, now=NOW) == expected
+    assert expected in STATES
+
+
+def test_a_ready_pod_whose_game_is_still_booting_is_waking_for_a_grace_period():
+    fresh = StatefulSetStatus(exists=True, replicas=1, ready_replicas=1, scaled_at=JUST_NOW)
+    assert server_state(fresh, STOPPED, now=NOW) == "waking"
+    assert server_state(fresh, STOPPED, now=NOW + WAKE_GRACE) == "stopped"
+    assert server_state(fresh, RUNNING, now=NOW) == "awake"
+    # Without a scale-up time nothing excuses a not-running game.
+    unknown = StatefulSetStatus(exists=True, replicas=1, ready_replicas=1)
+    assert server_state(unknown, STOPPED, now=NOW) == "stopped"
+
+
+def test_state_over_http_for_each_wrapper_answer(client, cluster, created):
+    def state():
+        return client.get("/api/v1/servers/alpha", headers=ALICE).json()["state"]
+
+    cluster.wrappers["alpha"] = READY
+    cluster.wrapper_statuses["alpha"] = RUNNING
+    assert state() == "awake"
+    cluster.wrapper_statuses["alpha"] = STOPPED
+    assert state() == "stopped"
+    cluster.wrapper_statuses["alpha"] = None  # timed out
+    assert state() == "awake"
+    cluster.wrappers["alpha"] = NOT_READY
+    cluster.wrapper_statuses["alpha"] = STOPPED
+    assert state() == "waking"
+    cluster.wrappers["alpha"] = StatefulSetStatus(
+        exists=True, replicas=1, ready_replicas=1, scaled_at=datetime.now(UTC)
+    )
+    assert state() == "waking"  # booting: within the grace period after scale-up
+
+
+def test_a_wrapper_that_cannot_be_asked_never_breaks_the_list(client, cluster, created):
+    cluster.wrapper_statuses["alpha"] = None
+    resp = client.get("/api/v1/servers", headers=ALICE)
+    assert resp.status_code == 200
+    assert resp.json()[0]["state"] == "awake"
+    assert client.get("/api/v1/servers/alpha", headers=ALICE).status_code == 200
+
+
+def test_asleep_servers_are_not_asked(client, cluster, created):
+    """No pod, nothing to ask: the wrapper call is skipped rather than timed out."""
+    calls = []
+    cluster.wrapper_status = lambda name: calls.append(name)  # type: ignore[method-assign]
+    cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
+    assert client.get("/api/v1/servers", headers=ALICE).json()[0]["state"] == "asleep"
+    assert calls == []
 
 
 # --- two tenants -------------------------------------------------------------
@@ -204,21 +295,77 @@ def test_each_tenant_sees_only_their_own(client, settings, created):
 
 
 def test_wake_scales_the_wrapper_to_one(client, cluster, created):
-    cluster.wrappers["alpha"] = WrapperStatus(exists=True, replicas=0)
+    cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
     before = created["last_woken_at"]
     resp = client.post("/api/v1/servers/alpha/wake", headers=ALICE)
-    assert resp.status_code == 200
+    assert resp.status_code == 202
     assert resp.json()["state"] == "waking"
     assert cluster.ops[-1] == ("scale_wrapper", "alpha", 1)
     assert resp.json()["last_woken_at"] >= before
 
 
 def test_wake_when_already_up_does_nothing(client, cluster, created):
+    assert cluster.wrapper_status("alpha").running  # the fake's rollout started the game
     n_ops = len(cluster.ops)
     resp = client.post("/api/v1/servers/alpha/wake", headers=ALICE)
-    assert resp.status_code == 200
+    assert resp.status_code == 202
     assert resp.json()["state"] == "awake"
     assert len(cluster.ops) == n_ops
+
+
+def test_wake_of_a_stopped_server_starts_the_game_in_place(client, cluster, created, db):
+    """The observed case: Stop was pressed in the dashboard, the pod stayed Ready."""
+    cluster.stop_game("alpha")
+    before = created["last_woken_at"]
+    n_ops = len(cluster.ops)
+    resp = client.post("/api/v1/servers/alpha/wake", headers=ALICE)
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["state"] == "awake"
+    assert cluster.ops[n_ops:] == [("start_wrapper", "alpha")]  # not a scale: replicas is 1
+    assert resp.json()["last_woken_at"] >= before
+    assert [e["kind"] for e in db.events("alpha")][-1] == "wake.start"
+
+
+def test_wake_while_waking_leaves_it_alone(client, cluster, created):
+    n_ops = len(cluster.ops)
+    # Pod not ready yet.
+    cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=1, ready_replicas=0)
+    resp = client.post("/api/v1/servers/alpha/wake", headers=ALICE)
+    assert resp.status_code == 202 and resp.json()["state"] == "waking"
+    # Pod ready, game still booting after a fresh scale-up.
+    cluster.wrappers["alpha"] = StatefulSetStatus(
+        exists=True, replicas=1, ready_replicas=1, scaled_at=datetime.now(UTC)
+    )
+    cluster.wrapper_statuses["alpha"] = STOPPED
+    resp = client.post("/api/v1/servers/alpha/wake", headers=ALICE)
+    assert resp.status_code == 202 and resp.json()["state"] == "waking"
+    assert len(cluster.ops) == n_ops  # no start call: it is booting on its own
+
+
+def test_wake_when_the_wrapper_cannot_be_asked_falls_back_to_replicas(client, cluster, created):
+    cluster.wrapper_statuses["alpha"] = None
+    n_ops = len(cluster.ops)
+    resp = client.post("/api/v1/servers/alpha/wake", headers=ALICE)
+    assert resp.status_code == 202
+    assert resp.json()["state"] == "awake"
+    assert len(cluster.ops) == n_ops
+
+
+def test_wake_of_a_failed_server_reports_the_failure(client, cluster, created):
+    cluster.fail_pod("alpha")
+    n_ops = len(cluster.ops)
+    resp = client.post("/api/v1/servers/alpha/wake", headers=ALICE)
+    assert resp.status_code == 202
+    assert resp.json()["state"] == "failed"
+    assert len(cluster.ops) == n_ops
+
+
+def test_wake_start_failure_is_502(client, cluster, created):
+    cluster.stop_game("alpha")
+    cluster.fail_on.add("start_wrapper")
+    resp = client.post("/api/v1/servers/alpha/wake", headers=ALICE)
+    assert resp.status_code == 502
+    assert "start_wrapper" in resp.json()["detail"]
 
 
 def test_wake_unknown_server_is_404(client):
@@ -229,7 +376,7 @@ def test_wake_unknown_server_is_404(client):
 
 
 def test_delete_backs_up_before_the_namespace_goes(client, cluster, created, db):
-    cluster.wrappers["alpha"] = WrapperStatus(exists=True, replicas=0)  # asleep
+    cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)  # asleep
     resp = client.delete("/api/v1/servers/alpha", headers=ALICE)
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -252,6 +399,12 @@ def test_delete_backs_up_before_the_namespace_goes(client, cluster, created, db)
 
 def test_delete_of_an_awake_server_uses_exec(client, cluster, created):
     cluster.players["alpha"] = 0
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 200
+    assert ("backup_world", "alpha", True) in cluster.ops
+
+
+def test_delete_of_a_stopped_server_still_execs_into_its_pod(client, cluster, created):
+    cluster.stop_game("alpha")
     assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 200
     assert ("backup_world", "alpha", True) in cluster.ops
 
@@ -288,7 +441,7 @@ def test_force_delete_tolerates_an_impossible_backup(client, cluster, created, d
 
 
 def test_after_delete_the_name_can_be_reused(client, cluster, created):
-    cluster.wrappers["alpha"] = WrapperStatus(exists=True, replicas=0)
+    cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
     assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 200
     assert client.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE).status_code == 201
 
@@ -314,8 +467,8 @@ def test_fake_install_keeps_an_awake_wrapper_awake(cluster):
     spec = ReleaseSpec(name="alpha", hostname="h", sslip_hostname="s", motd="m")
     cluster.install_release(spec, Credentials.generate())
     assert cluster.ops[-1] == ("install_release", "alpha", False)
-    assert cluster.wrapper_status("alpha").replicas == 0
+    assert cluster.statefulset_status("alpha").replicas == 0
     cluster.scale_wrapper("alpha", 1)
     cluster.install_release(spec, Credentials.generate())
     assert cluster.ops[-1] == ("install_release", "alpha", True)
-    assert cluster.wrapper_status("alpha").replicas == 1
+    assert cluster.statefulset_status("alpha").replicas == 1

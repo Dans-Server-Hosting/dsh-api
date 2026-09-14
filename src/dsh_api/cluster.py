@@ -12,14 +12,18 @@ import secrets
 import socket
 import struct
 import subprocess
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
 WRAPPER_PVC_SUFFIX = "-omcsi-mcserver"
 WRAPPER_STS_SUFFIX = "-omcsi-minecraft-wrapper"
 WRAPPER_COMPONENT_LABEL = "app.kubernetes.io/component=minecraft-wrapper"
+WRAPPER_API_PORT = 8092
+WRAPPER_HTTP_TIMEOUT = 3.0
 FAILING_REASONS = {"CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull", "Error", "OOMKilled"}
 
 
@@ -60,19 +64,53 @@ class ReleaseSpec:
 
 
 @dataclass(frozen=True)
-class WrapperStatus:
+class StatefulSetStatus:
+    """What the wrapper StatefulSet says: does the pod exist and is it ready."""
+
     exists: bool
     replicas: int = 0
     ready_replicas: int = 0
     failing: bool = False
+    scaled_at: datetime | None = None
+    """When the wrapper pod was created, i.e. when the server was last scaled up."""
 
     @property
     def state(self) -> str:
+        """The replica-based reading alone; ``service.server_state`` refines it
+        with what the wrapper process reports."""
         if not self.exists or self.failing:
             return "failed"
         if self.replicas == 0:
             return "asleep"
         return "awake" if self.ready_replicas >= 1 else "waking"
+
+
+@dataclass(frozen=True)
+class WrapperStatus:
+    """What the wrapper's own API says about the game process it supervises.
+
+    A ready pod only means the wrapper's Spring application is up; whether the
+    Minecraft process is running is a separate question, and this answers it.
+    """
+
+    running: bool
+    pid: int | None = None
+    uptime_seconds: int | None = None
+    started_at: str | None = None
+
+    @classmethod
+    def from_json(cls, data: object) -> WrapperStatus | None:
+        if not isinstance(data, dict) or not isinstance(data.get("running"), bool):
+            return None
+        pid = data.get("pid")
+        uptime = data.get("uptimeSeconds")
+        started = data.get("startedAt")
+        return cls(
+            running=data["running"],
+            pid=int(pid) if isinstance(pid, int | float) else None,
+            uptime_seconds=int(uptime) if isinstance(uptime, int | float) else None,
+            started_at=str(started) if started is not None else None,
+        )
 
 
 class ClusterBackend(Protocol):
@@ -94,7 +132,15 @@ class ClusterBackend(Protocol):
     def wait_for_rollout(self, name: str) -> None:
         """Block until the wrapper StatefulSet, webapp and nginx have rolled out."""
 
-    def wrapper_status(self, name: str) -> WrapperStatus: ...
+    def statefulset_status(self, name: str) -> StatefulSetStatus:
+        """Replicas and readiness of the wrapper StatefulSet."""
+
+    def wrapper_status(self, name: str) -> WrapperStatus | None:
+        """What the wrapper reports about the game process, or None when the
+        wrapper cannot be asked (pod gone, not listening yet, timeout)."""
+
+    def start_wrapper(self, name: str) -> None:
+        """Ask a running wrapper to start the game process it supervises."""
 
     def players_online(self, name: str) -> int | None:
         """Player count from the game server, or None when it cannot be asked."""
@@ -288,14 +334,48 @@ def server_list_ping(host: str, port: int = 25565, timeout: float = 2.0) -> dict
     return json.loads(data.decode())
 
 
+def wrapper_api_url(name: str, path: str) -> str:
+    """The wrapper's internal API, reachable only from inside the cluster."""
+    host = f"{name}{WRAPPER_STS_SUFFIX}-internal.{namespace_for(name)}.svc.cluster.local"
+    return f"http://{host}:{WRAPPER_API_PORT}{path}"
+
+
+def http_json(
+    url: str, method: str = "GET", timeout: float = WRAPPER_HTTP_TIMEOUT
+) -> tuple[int, object] | None:
+    """One HTTP round trip; ``(status, parsed body)``, or None when the host
+    could not be reached at all (refused, unresolvable, timed out)."""
+    request = urllib.request.Request(url, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            status = resp.status
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        raw = exc.read()
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    try:
+        body = json.loads(raw.decode()) if raw else None
+    except ValueError:
+        body = None
+    return status, body
+
+
 class KubectlHelmBackend:
     def __init__(
-        self, omcsi_dir: str, backup_dir: str, rollout_timeout: str = "5m", run=run_command
+        self,
+        omcsi_dir: str,
+        backup_dir: str,
+        rollout_timeout: str = "5m",
+        run=run_command,
+        http=http_json,
     ) -> None:
         self.omcsi_dir = omcsi_dir
         self.backup_dir = Path(backup_dir)
         self.rollout_timeout = rollout_timeout
         self._run = run
+        self._http = http
 
     def namespace_exists(self, name: str) -> bool:
         try:
@@ -327,7 +407,7 @@ class KubectlHelmBackend:
         self._run(["kubectl", "apply", "-f", "-"], stdin=json.dumps(secret))
 
     def install_release(self, spec: ReleaseSpec, creds: Credentials) -> None:
-        current = self.wrapper_status(spec.name)
+        current = self.statefulset_status(spec.name)
         keep_awake = current.exists and current.replicas >= 1
         self._run(helm_install_argv(spec, creds, self.omcsi_dir, keep_awake=keep_awake))
 
@@ -349,7 +429,7 @@ class KubectlHelmBackend:
                 f"--timeout={self.rollout_timeout}",
             ])  # fmt: skip
 
-    def wrapper_status(self, name: str) -> WrapperStatus:
+    def statefulset_status(self, name: str) -> StatefulSetStatus:
         ns = namespace_for(name)
         try:
             raw = self._run(
@@ -366,29 +446,63 @@ class KubectlHelmBackend:
             )
         except ClusterError as exc:
             if "NotFound" in str(exc) or "not found" in str(exc):
-                return WrapperStatus(exists=False)
+                return StatefulSetStatus(exists=False)
             raise
         sts = json.loads(raw)
         replicas = int(sts.get("spec", {}).get("replicas") or 0)
         ready = int(sts.get("status", {}).get("readyReplicas") or 0)
-        failing = replicas > 0 and self._wrapper_pod_failing(ns)
-        return WrapperStatus(exists=True, replicas=replicas, ready_replicas=ready, failing=failing)
+        failing, scaled_at = (False, None) if replicas == 0 else self._wrapper_pods(ns)
+        return StatefulSetStatus(
+            exists=True,
+            replicas=replicas,
+            ready_replicas=ready,
+            failing=failing,
+            scaled_at=scaled_at,
+        )
 
-    def _wrapper_pod_failing(self, ns: str) -> bool:
+    def _wrapper_pods(self, ns: str) -> tuple[bool, datetime | None]:
+        """Whether any wrapper pod is failing, and when the oldest one was created.
+
+        A StatefulSet keeps no record of when it was last scaled; its pod's
+        creation time is that moment, since scaling to zero deletes the pod.
+        """
         raw = self._run(
             ["kubectl", "-n", ns, "get", "pods", "-l", WRAPPER_COMPONENT_LABEL, "-o", "json"]
         )
+        failing = False
+        created: datetime | None = None
         for pod in json.loads(raw).get("items", []):
+            stamp = pod.get("metadata", {}).get("creationTimestamp")
+            if stamp:
+                try:
+                    when = datetime.fromisoformat(stamp)
+                except ValueError:
+                    when = None
+                if when is not None and (created is None or when < created):
+                    created = when
             if pod.get("status", {}).get("phase") == "Failed":
-                return True
+                failing = True
             statuses = pod.get("status", {}).get("containerStatuses", []) + pod.get(
                 "status", {}
             ).get("initContainerStatuses", [])
             for cs in statuses:
                 waiting = cs.get("state", {}).get("waiting") or {}
                 if waiting.get("reason") in FAILING_REASONS:
-                    return True
-        return False
+                    failing = True
+        return failing, created
+
+    def wrapper_status(self, name: str) -> WrapperStatus | None:
+        answer = self._http(wrapper_api_url(name, "/api/server/status"))
+        if answer is None or answer[0] != 200:
+            return None
+        return WrapperStatus.from_json(answer[1])
+
+    def start_wrapper(self, name: str) -> None:
+        answer = self._http(wrapper_api_url(name, "/api/server/start"), method="POST")
+        if answer is None:
+            raise ClusterError("the wrapper could not be reached to start the server")
+        if answer[0] != 200:
+            raise ClusterError(f"the wrapper refused to start the server (HTTP {answer[0]})")
 
     def players_online(self, name: str) -> int | None:
         host = f"{name}{WRAPPER_STS_SUFFIX}.{namespace_for(name)}.svc"
@@ -461,7 +575,9 @@ class FakeClusterBackend:
     namespaces: set[str] = field(default_factory=set)
     credentials: dict[str, Credentials] = field(default_factory=dict)
     releases: dict[str, ReleaseSpec] = field(default_factory=dict)
-    wrappers: dict[str, WrapperStatus] = field(default_factory=dict)
+    wrappers: dict[str, StatefulSetStatus] = field(default_factory=dict)
+    wrapper_statuses: dict[str, WrapperStatus | None] = field(default_factory=dict)
+    """Per server, what its wrapper answers; absent or None means unreachable."""
     players: dict[str, int | None] = field(default_factory=dict)
     ops: list[tuple] = field(default_factory=list)
     fail_on: set[str] = field(default_factory=set)
@@ -483,18 +599,22 @@ class FakeClusterBackend:
         self.credentials[name] = creds
 
     def install_release(self, spec: ReleaseSpec, creds: Credentials) -> None:
-        current = self.wrappers.get(spec.name, WrapperStatus(exists=False))
+        current = self.wrappers.get(spec.name, StatefulSetStatus(exists=False))
         keep_awake = current.exists and current.replicas >= 1
         self._op("install_release", spec.name, keep_awake)
         self.releases[spec.name] = spec
-        self.wrappers[spec.name] = WrapperStatus(exists=True, replicas=1 if keep_awake else 0)
+        self.wrappers[spec.name] = StatefulSetStatus(exists=True, replicas=1 if keep_awake else 0)
 
     def scale_wrapper(self, name: str, replicas: int) -> None:
         self._op("scale_wrapper", name, replicas)
         current = self.wrappers.get(name)
         if current is None or not current.exists:
             raise ClusterError(f"statefulset {name}{WRAPPER_STS_SUFFIX} not found")
-        self.wrappers[name] = replace(current, replicas=replicas, ready_replicas=0)
+        scaled_at = datetime.now(UTC) if replicas >= 1 else None
+        self.wrappers[name] = replace(
+            current, replicas=replicas, ready_replicas=0, scaled_at=scaled_at
+        )
+        self.wrapper_statuses.pop(name, None)  # a fresh pod is not listening yet
 
     def wait_for_rollout(self, name: str) -> None:
         self._op("wait_for_rollout", name)
@@ -502,9 +622,21 @@ class FakeClusterBackend:
         if current is None or current.replicas < 1:
             raise ClusterError(f"rollout of {name}{WRAPPER_STS_SUFFIX} timed out (simulated)")
         self.wrappers[name] = replace(current, ready_replicas=1)
+        # A rolled-out wrapper has started the game, the way the real one does.
+        self.wrapper_statuses[name] = WrapperStatus(running=True, pid=1, uptime_seconds=0)
 
-    def wrapper_status(self, name: str) -> WrapperStatus:
-        return self.wrappers.get(name, WrapperStatus(exists=False))
+    def statefulset_status(self, name: str) -> StatefulSetStatus:
+        return self.wrappers.get(name, StatefulSetStatus(exists=False))
+
+    def wrapper_status(self, name: str) -> WrapperStatus | None:
+        return self.wrapper_statuses.get(name)
+
+    def start_wrapper(self, name: str) -> None:
+        self._op("start_wrapper", name)
+        current = self.wrappers.get(name)
+        if current is None or current.ready_replicas < 1:
+            raise ClusterError("the wrapper could not be reached to start the server")
+        self.wrapper_statuses[name] = WrapperStatus(running=True, pid=1, uptime_seconds=0)
 
     def players_online(self, name: str) -> int | None:
         return self.players.get(name)
@@ -523,6 +655,7 @@ class FakeClusterBackend:
         self._op("uninstall_release", name)
         self.releases.pop(name, None)
         self.wrappers.pop(name, None)
+        self.wrapper_statuses.pop(name, None)
 
     def delete_namespace(self, name: str) -> None:
         self._op("delete_namespace", name)
@@ -536,3 +669,10 @@ class FakeClusterBackend:
 
     def fail_pod(self, name: str) -> None:
         self.wrappers[name] = replace(self.wrappers[name], failing=True)
+
+    def stop_game(self, name: str) -> None:
+        """The owner pressed Stop in the dashboard some time after the server
+        came up: pod still up and Ready, game process gone, grace period over."""
+        long_ago = datetime.now(UTC) - timedelta(hours=1)
+        self.wrappers[name] = replace(self.wrappers[name], scaled_at=long_ago)
+        self.wrapper_statuses[name] = WrapperStatus(running=False)
