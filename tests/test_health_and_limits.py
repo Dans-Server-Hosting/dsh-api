@@ -42,12 +42,20 @@ def test_settings_from_env():
             "DSH_NODE_IP": "203.0.113.10",
             "DSH_MAX_SERVERS_PER_TENANT": "2",
             "USERAUTH_JWT_SECRET": "s",
+            "DSH_SERVICE_ACCOUNT_NAMESPACE": "platform",
+            "DSH_SERVICE_ACCOUNT_NAME": "api-sa",
         }
     )
     assert s.hostname("alpha") == "alpha.play.example.com"
     assert s.sslip_hostname("alpha") == "alpha.203-0-113-10.sslip.io"
     assert s.max_servers_per_tenant == 2
     assert s.jwt_secret == "s"
+    assert (s.service_account_namespace, s.service_account_name) == ("platform", "api-sa")
+    defaults = Settings.from_env({})
+    assert (defaults.service_account_namespace, defaults.service_account_name) == (
+        "dsh-api",
+        "dsh-api",
+    )  # what deploy/rbac.yaml creates
 
 
 def test_settings_defaults_for_admins_and_plugins():

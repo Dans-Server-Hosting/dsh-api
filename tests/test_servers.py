@@ -7,7 +7,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from dsh_api.auth import FakeValidator
-from dsh_api.cluster import Credentials, ReleaseSpec, StatefulSetStatus, WrapperStatus
+from dsh_api.cluster import (
+    ClusterError,
+    Credentials,
+    ReleaseSpec,
+    StatefulSetStatus,
+    WrapperStatus,
+)
 from dsh_api.config import DEFAULT_PLUGINS, Settings
 from dsh_api.db import Database
 from dsh_api.main import create_app
@@ -38,12 +44,14 @@ def test_create_provisions_like_the_operator_script(client, cluster, created):
 
     assert cluster.ops == [
         ("create_tenant_namespace", "alpha"),
+        ("grant_tenant_access", "alpha"),  # the API's own RoleBinding, before anything namespaced
         ("create_credentials", "alpha"),
         ("install_release", "alpha", False),  # the profile's replicas: 0 stands
         ("scale_wrapper", "alpha", 1),  # woken once, so the webapp can start
         ("wait_for_rollout", "alpha"),  # only now: helm itself must not wait
     ]
     assert "t-alpha" in cluster.namespaces
+    assert "t-alpha" in cluster.bound
     assert cluster.releases["alpha"] == ReleaseSpec(
         name="alpha",
         hostname="alpha.play.example.com",
@@ -146,6 +154,7 @@ def test_create_answers_202_and_provisions_in_the_background(client, cluster, jo
     assert jobs.run() == 1
     assert [op[0] for op in cluster.ops] == [
         "create_tenant_namespace",
+        "grant_tenant_access",
         "create_credentials",
         "install_release",
         "scale_wrapper",
@@ -642,9 +651,39 @@ def test_create_rejects_impossible_operator_usernames(client, cluster, username)
     assert cluster.ops == []
 
 
+def test_fake_refuses_namespaced_steps_without_the_tenant_binding(cluster):
+    """Mirrors the cluster: with the scoped RBAC, nothing namespaced works in
+    t-<name> until the RoleBinding is there, so the order of steps is checked."""
+    spec = ReleaseSpec(name="alpha", hostname="h", sslip_hostname="s", motd="m")
+    cluster.create_tenant_namespace("alpha")
+    with pytest.raises(ClusterError, match="forbidden"):
+        cluster.create_credentials("alpha", Credentials.generate())
+    with pytest.raises(ClusterError, match="forbidden"):
+        cluster.install_release(spec, Credentials.generate())
+    cluster.grant_tenant_access("alpha")
+    cluster.create_credentials("alpha", Credentials.generate())
+    cluster.install_release(spec, Credentials.generate())
+    # A binding cannot be created in a namespace that does not exist.
+    with pytest.raises(ClusterError, match="not found"):
+        cluster.grant_tenant_access("ghost")
+
+
+def test_a_binding_failure_fails_the_create_before_the_secret(client, cluster, db, jobs):
+    cluster.fail_on.add("grant_tenant_access")
+    resp = client.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE)
+    assert resp.status_code == 202
+    assert jobs.run() == 1
+    assert [op[0] for op in cluster.ops] == ["create_tenant_namespace", "grant_tenant_access"]
+    assert "alpha" not in cluster.credentials
+    assert db.events("alpha")[-1]["kind"] == "create.failed"
+    assert client.get("/api/v1/servers/alpha", headers=ALICE).json()["state"] == "failed"
+
+
 def test_fake_install_keeps_an_awake_wrapper_awake(cluster):
     """Mirrors the real backend: a re-run over a wrapper at 1 replica must not sleep it."""
     spec = ReleaseSpec(name="alpha", hostname="h", sslip_hostname="s", motd="m")
+    cluster.create_tenant_namespace("alpha")
+    cluster.grant_tenant_access("alpha")
     cluster.install_release(spec, Credentials.generate())
     assert cluster.ops[-1] == ("install_release", "alpha", False)
     assert cluster.statefulset_status("alpha").replicas == 0

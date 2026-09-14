@@ -67,7 +67,10 @@ def create_app(
     settings = settings or Settings.from_env()
     db = db or Database(settings.db_path)
     cluster = cluster or KubectlHelmBackend(
-        settings.omcsi_dir, settings.backup_dir, settings.rollout_timeout
+        settings.omcsi_dir,
+        settings.backup_dir,
+        settings.rollout_timeout,
+        service_account=(settings.service_account_namespace, settings.service_account_name),
     )
     validator = validator or Hs256Validator(settings.jwt_secret)
     uuids = uuids or MojangResolver()

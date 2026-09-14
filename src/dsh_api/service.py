@@ -226,6 +226,8 @@ class ServerService:
         name = spec.name
         try:
             self.cluster.create_tenant_namespace(name)
+            # Before anything namespaced: the API's own permissions in t-<name>.
+            self.cluster.grant_tenant_access(name)
             self.cluster.create_credentials(name, creds)
             # The profile installs the wrapper asleep and the webapp waits for
             # it, so the release is installed without waiting, the wrapper is
