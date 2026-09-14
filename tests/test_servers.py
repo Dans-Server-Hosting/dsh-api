@@ -154,6 +154,7 @@ def test_create_answers_202_and_provisions_in_the_background(client, cluster, jo
     assert jobs.run() == 1
     assert [op[0] for op in cluster.ops] == [
         "create_tenant_namespace",
+        "grant_tenant_access",
         "create_credentials",
         "install_release",
         "scale_wrapper",
@@ -667,13 +668,15 @@ def test_fake_refuses_namespaced_steps_without_the_tenant_binding(cluster):
         cluster.grant_tenant_access("ghost")
 
 
-def test_a_binding_failure_fails_the_create_before_the_secret(client, cluster, db):
+def test_a_binding_failure_fails_the_create_before_the_secret(client, cluster, db, jobs):
     cluster.fail_on.add("grant_tenant_access")
     resp = client.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE)
-    assert resp.status_code == 502
+    assert resp.status_code == 202
+    assert jobs.run() == 1
     assert [op[0] for op in cluster.ops] == ["create_tenant_namespace", "grant_tenant_access"]
     assert "alpha" not in cluster.credentials
     assert db.events("alpha")[-1]["kind"] == "create.failed"
+    assert client.get("/api/v1/servers/alpha", headers=ALICE).json()["state"] == "failed"
 
 
 def test_fake_install_keeps_an_awake_wrapper_awake(cluster):
