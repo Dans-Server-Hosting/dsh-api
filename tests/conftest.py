@@ -10,9 +10,6 @@ from dsh_api.db import Database
 from dsh_api.main import create_app
 from dsh_api.mojang import FakeResolver
 
-ALICE = {"Authorization": "Bearer alice-token"}
-BOB = {"Authorization": "Bearer bob-token"}
-
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
@@ -56,6 +53,8 @@ def client(settings, db, cluster, resolver) -> TestClient:
 @pytest.fixture
 def created(client: TestClient) -> dict:
     """A server named ``alpha`` owned by alice, freshly provisioned."""
-    resp = client.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE)
+    resp = client.post(
+        "/api/v1/servers", json={"name": "alpha"}, headers={"Authorization": "Bearer alice-token"}
+    )
     assert resp.status_code == 201, resp.text
     return resp.json()

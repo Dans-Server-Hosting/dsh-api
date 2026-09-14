@@ -3,7 +3,9 @@
 import pytest
 
 from dsh_api.cluster import Credentials, ReleaseSpec, WrapperStatus
-from tests.conftest import ALICE, BOB
+
+ALICE = {"Authorization": "Bearer alice-token"}
+BOB = {"Authorization": "Bearer bob-token"}
 
 # --- create ----------------------------------------------------------------
 
