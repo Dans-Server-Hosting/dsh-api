@@ -256,13 +256,18 @@ class ServerService:
         """Scale an asleep wrapper up, or start the game on a stopped one.
 
         A waking or awake server is left alone, as is a failed one (scaling a
-        crash-looping pod does nothing useful; the failure is reported instead).
+        crash-looping pod does nothing useful, and a StatefulSet that is gone
+        cannot be scaled at all; the failure is reported instead).
         """
         row = self._owned(tenant_id, name)
         if row.status != "ready":
             # Still being created, or the create failed: nothing to scale yet.
             return self._view(row, with_players=False)
         sts = self.cluster.statefulset_status(name)
+        if sts.state == "failed":
+            # A missing StatefulSet has zero replicas too; the scale below would
+            # only turn what GET reports as ``failed`` into a 502 from kubectl.
+            return self._view(row, with_players=False)
         if sts.replicas < 1:
             self.cluster.scale_wrapper(name, 1)
             self.db.mark_woken(name)

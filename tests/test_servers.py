@@ -549,6 +549,18 @@ def test_wake_of_a_failed_server_reports_the_failure(client, cluster, created):
     assert len(cluster.ops) == n_ops
 
 
+def test_wake_of_a_server_whose_statefulset_is_gone_reports_the_failure(client, cluster, created):
+    """The release was removed behind the API's back: ``GET`` says ``failed``,
+    and ``wake`` must say the same rather than scale a StatefulSet that is not
+    there (a 502 from kubectl)."""
+    del cluster.wrappers["alpha"]
+    n_ops = len(cluster.ops)
+    resp = client.post("/api/v1/servers/alpha/wake", headers=ALICE)
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["state"] == "failed"
+    assert cluster.ops[n_ops:] == []  # no scale attempted
+
+
 def test_wake_start_failure_is_502(client, cluster, created):
     cluster.stop_game("alpha")
     cluster.fail_on.add("start_wrapper")
