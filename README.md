@@ -68,6 +68,7 @@ never fails a list or get.
 |---|---|---|
 | `GET` | `/healthz` | liveness |
 | `GET` | `/api/v1/limits` | free-tier profile as numbers; no token needed |
+| `GET` | `/api/v1/default-plugins` | the plugins every new server is installed with, in install order (`name`, `version`, `description`, `download_url`, `project_url`); no token needed |
 | `GET` | `/api/v1/servers` | the caller's servers |
 | `POST` | `/api/v1/servers` | `{name, motd?, operator_username?}` → **202** with the server in state `provisioning`; the admin password is in this response **only**. 409 `{"detail": "a server is already being created for this account", "server": "<name>"}` while the caller's earlier create is still running; 409 when the name is taken; 403 at the tenant cap |
 | `GET` | `/api/v1/servers/{name}` | one server, with `players_online` when `awake` (`null` otherwise) |
@@ -104,6 +105,11 @@ otherwise split them).
   cap `403` is unchanged and only ever means the account is full.
 - A `failed` server may be a create that failed: it still counts against the
   cap, and `DELETE` (no `force` needed) is how the account gets its slot back.
+- `GET /api/v1/default-plugins` is what to show for "what comes installed":
+  it is derived from `DSH_DEFAULT_PLUGINS`, so it is always what a new server
+  actually gets. `description` is empty and `project_url` is `null` for a
+  plugin the API does not know (see `KNOWN_PLUGINS` in `plugins.py`); show
+  the name and version and omit the rest.
 
 ## Running locally
 
@@ -135,7 +141,7 @@ OMCSI checkout at `OMCSI_CHART_DIR` (the image provides all three).
 | `DSH_SERVICE_ACCOUNT_NAME` | `dsh-api` | the ServiceAccount the per-tenant RoleBinding is made out to; the Deployment sets it from `spec.serviceAccountName` |
 | `DSH_MAX_SERVERS_PER_TENANT` | `1` | the cap behind the 403 |
 | `DSH_ADMIN_USERS` | `dmccoystephenson` | comma-separated JWT `sub`s that may read and triage feedback |
-| `DSH_DEFAULT_PLUGINS` | Dan's Plugin Manager `0.7.0-SNAPSHOT-8-8-2026`, ViaVersion `5.12.0`, ViaBackwards `5.12.0` release jars | comma-separated plugin download URLs every new server is installed with; empty for none |
+| `DSH_DEFAULT_PLUGINS` | Dan's Plugin Manager `0.7.0-SNAPSHOT-8-8-2026`, ViaVersion `5.12.0`, ViaBackwards `5.12.0` release jars | comma-separated plugin download URLs every new server is installed with; empty for none. Also what `GET /api/v1/default-plugins` describes |
 | `DSH_LIMIT_HEAP_GB` | `3` | free-tier profile served by `GET /api/v1/limits` |
 | `DSH_LIMIT_MEMORY_LIMIT_GIB` | `3.5` | " |
 | `DSH_LIMIT_WORLD_QUOTA_GIB` | `5` | " |

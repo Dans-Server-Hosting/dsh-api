@@ -15,6 +15,7 @@ from dsh_api.config import Settings
 from dsh_api.db import Database
 from dsh_api.feedback import FeedbackNotFound, FeedbackRateLimited, FeedbackService
 from dsh_api.mojang import MojangResolver, UnknownUsername, UuidResolver
+from dsh_api.plugins import describe_default_plugins
 from dsh_api.service import (
     CreateInProgress,
     JobRunner,
@@ -123,6 +124,12 @@ def create_app(
     @app.get("/api/v1/limits")
     def limits() -> dict:
         return {"servers_per_tenant": settings.max_servers_per_tenant, **asdict(settings.limits)}
+
+    @app.get("/api/v1/default-plugins")
+    def default_plugins() -> list[dict]:
+        """The plugins every new server is installed with, in install order.
+        Public, like ``/limits``: the portal shows it before sign-in."""
+        return describe_default_plugins(settings.default_plugins)
 
     @app.get("/api/v1/servers")
     def list_servers(tenant: Tenant) -> list[dict]:
