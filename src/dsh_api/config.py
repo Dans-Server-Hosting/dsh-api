@@ -6,9 +6,19 @@ import os
 from dataclasses import dataclass, field
 
 DEFAULT_ADMIN_USERS = "dmccoystephenson"
-DEFAULT_PLUGINS = (
-    "https://github.com/Dans-Plugins/Dans-Plugin-Manager/releases/download/"
-    "v0.7.0-SNAPSHOT-8-8-2026/DansPluginManager-0.7.0-SNAPSHOT-8-8-2026.jar"
+# Every server starts with Dan's Plugin Manager plus ViaVersion + ViaBackwards,
+# so clients on other Minecraft versions can join (ViaVersion 5.12.0 is the
+# first release that admits 26.3 clients to a 26.2 server; 5.11.0 was the
+# first that worked on 26.2 at all -- the 5.6.x pair enabled but never
+# injected). ViaBackwards `depend`s on ViaVersion: both or neither. GitHub
+# release assets are immutable, so each entry pins one exact jar.
+DEFAULT_PLUGINS = ",".join(
+    (
+        "https://github.com/Dans-Plugins/Dans-Plugin-Manager/releases/download/"
+        "v0.7.0-SNAPSHOT-8-8-2026/DansPluginManager-0.7.0-SNAPSHOT-8-8-2026.jar",
+        "https://github.com/ViaVersion/ViaVersion/releases/download/5.12.0/ViaVersion-5.12.0.jar",
+        "https://github.com/ViaVersion/ViaBackwards/releases/download/5.12.0/ViaBackwards-5.12.0.jar",
+    )
 )
 
 

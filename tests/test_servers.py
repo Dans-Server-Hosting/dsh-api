@@ -14,7 +14,7 @@ from dsh_api.cluster import (
     StatefulSetStatus,
     WrapperStatus,
 )
-from dsh_api.config import DEFAULT_PLUGINS, Settings
+from dsh_api.config import DEFAULT_PLUGINS, Settings, split_csv
 from dsh_api.db import Database
 from dsh_api.main import create_app
 from dsh_api.service import STATES, WAKE_GRACE, server_state
@@ -57,7 +57,7 @@ def test_create_provisions_like_the_operator_script(client, cluster, created):
         hostname="alpha.play.example.com",
         sslip_hostname="alpha.203-0-113-10.sslip.io",
         motd="alpha on Dan's Server Hosting",
-        default_plugins=(DEFAULT_PLUGINS,),  # Dan's Plugin Manager, like the operator's script
+        default_plugins=split_csv(DEFAULT_PLUGINS),  # DPM + Via pair, like the operator script
     )
 
 
