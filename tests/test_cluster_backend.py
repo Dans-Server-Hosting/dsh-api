@@ -456,6 +456,37 @@ def test_http_json_is_none_on_timeout_or_refused_connection():
     assert http_json(f"http://127.0.0.1:{port}/api/server/status", timeout=0.5) is None
 
 
+def test_uninstall_of_a_release_that_is_already_gone_is_not_an_error(tmp_path):
+    """helm: ``uninstall: Release not loaded: x: release: not found``. A delete
+    retried after an earlier attempt (or the operator) removed the release must
+    carry on to the namespace and the row (example, 2026-09-19)."""
+    runner = Runner(
+        ClusterError(
+            "helm uninstall failed: Error: uninstall: Release not loaded: alpha: release: not found"
+        )
+    )
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
+    be.uninstall_release("alpha")  # no raise
+    assert runner.calls[0][0] == ["helm", "uninstall", "alpha", "-n", "t-alpha"]
+
+
+def test_uninstall_failing_for_any_other_reason_still_raises(tmp_path):
+    runner = Runner(ClusterError("helm uninstall failed: Error: failed to delete release: alpha"))
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
+    with pytest.raises(ClusterError, match="failed to delete release"):
+        be.uninstall_release("alpha")
+
+
+def test_deleting_a_namespace_that_is_already_gone_is_not_an_error(tmp_path):
+    runner = Runner(
+        ClusterError(
+            'kubectl delete failed: Error from server (NotFound): namespaces "t-alpha" not found'
+        )
+    )
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
+    be.delete_namespace("alpha")  # no raise
+
+
 def test_backup_of_an_awake_server_execs_tar(tmp_path):
     runner = Runner("tarball-bytes")
     be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)

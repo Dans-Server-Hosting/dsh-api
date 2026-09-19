@@ -651,10 +651,20 @@ class KubectlHelmBackend:
         return path
 
     def uninstall_release(self, name: str) -> None:
-        self._run(["helm", "uninstall", name, "-n", namespace_for(name)])
+        """Idempotent: a release that is already gone (an earlier attempt, or
+        the operator's script, got that far) is not an error on the way out."""
+        try:
+            self._run(["helm", "uninstall", name, "-n", namespace_for(name)])
+        except ClusterError as exc:
+            if "release: not found" not in str(exc):
+                raise
 
     def delete_namespace(self, name: str) -> None:
-        self._run(["kubectl", "delete", "namespace", namespace_for(name), "--wait=false"])
+        try:
+            self._run(["kubectl", "delete", "namespace", namespace_for(name), "--wait=false"])
+        except ClusterError as exc:
+            if "NotFound" not in str(exc) and "not found" not in str(exc):
+                raise
 
 
 # ---------------------------------------------------------------------------
