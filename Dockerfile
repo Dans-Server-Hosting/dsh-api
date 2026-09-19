@@ -1,7 +1,11 @@
 # syntax=docker/dockerfile:1
 FROM python:3.11-slim
 
-ARG OMCSI_PIN=b7653aa7d5f841713aa8bd3c5c9eb96b7eb31e31
+# A commit on OMCSI main. The previous pin (b7653aa) was a merge commit on the
+# stacked feat/colocated-values-profile branch, unreachable since that branch
+# was merged and deleted on 2026-09-14, so `git clone` could not check it out.
+# e944a82 is what dsh-cluster/scripts/lib.sh pins and what the tenants run.
+ARG OMCSI_PIN=e944a82426582abfc4e793ffffc27054d3c603c3
 ARG KUBECTL_VERSION=v1.31.4
 ARG HELM_VERSION=v3.16.4
 
