@@ -87,9 +87,10 @@ never finish), one wake, then the wrapper, webapp and nginx rollouts (up to
 `DSH_ROLLOUT_TIMEOUT` each). Poll `GET /api/v1/servers/{name}` until `state`
 leaves `provisioning`; expect a few minutes. The release is installed with
 `minecraftWrapper.env.DEFAULT_PLUGINS` set from `DSH_DEFAULT_PLUGINS`, so a new
-server starts with Dan's Plugin Manager the way the operator's script installs
-it (commas in the list are escaped for `helm --set`, which would otherwise
-split them).
+server starts with Dan's Plugin Manager plus ViaVersion and ViaBackwards (so
+clients on other Minecraft versions can join), the same set the operator's
+script installs (commas in the list are escaped for `helm --set`, which would
+otherwise split them).
 
 ### Contract note for the portal
 
@@ -134,7 +135,7 @@ OMCSI checkout at `OMCSI_CHART_DIR` (the image provides all three).
 | `DSH_SERVICE_ACCOUNT_NAME` | `dsh-api` | the ServiceAccount the per-tenant RoleBinding is made out to; the Deployment sets it from `spec.serviceAccountName` |
 | `DSH_MAX_SERVERS_PER_TENANT` | `1` | the cap behind the 403 |
 | `DSH_ADMIN_USERS` | `dmccoystephenson` | comma-separated JWT `sub`s that may read and triage feedback |
-| `DSH_DEFAULT_PLUGINS` | Dan's Plugin Manager `0.7.0-SNAPSHOT-8-8-2026` release jar | comma-separated plugin download URLs every new server is installed with; empty for none |
+| `DSH_DEFAULT_PLUGINS` | Dan's Plugin Manager `0.7.0-SNAPSHOT-8-8-2026`, ViaVersion `5.12.0`, ViaBackwards `5.12.0` release jars | comma-separated plugin download URLs every new server is installed with; empty for none |
 | `DSH_LIMIT_HEAP_GB` | `3` | free-tier profile served by `GET /api/v1/limits` |
 | `DSH_LIMIT_MEMORY_LIMIT_GIB` | `3.5` | " |
 | `DSH_LIMIT_WORLD_QUOTA_GIB` | `5` | " |

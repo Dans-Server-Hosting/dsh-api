@@ -1,4 +1,4 @@
-from dsh_api.config import DEFAULT_PLUGINS, Limits, Settings
+from dsh_api.config import DEFAULT_PLUGINS, Limits, Settings, split_csv
 
 
 def test_healthz(client):
@@ -62,8 +62,14 @@ def test_settings_defaults_for_admins_and_plugins():
     s = Settings.from_env({"USERAUTH_JWT_SECRET": "s"})
     assert s.admin_users == frozenset({"dmccoystephenson"})
     assert s.is_admin("dmccoystephenson") and not s.is_admin("alice")
-    assert s.default_plugins == (DEFAULT_PLUGINS,)
-    assert DEFAULT_PLUGINS.startswith("https://github.com/Dans-Plugins/Dans-Plugin-Manager/")
+    assert s.default_plugins == split_csv(DEFAULT_PLUGINS)
+    assert len(s.default_plugins) == 3
+    dpm, viaversion, viabackwards = s.default_plugins
+    assert dpm.startswith("https://github.com/Dans-Plugins/Dans-Plugin-Manager/")
+    # ViaVersion + ViaBackwards ship together: ViaBackwards `depend`s on ViaVersion.
+    assert viaversion.startswith("https://github.com/ViaVersion/ViaVersion/releases/download/")
+    assert viabackwards.startswith("https://github.com/ViaVersion/ViaBackwards/releases/download/")
+    assert viaversion.rsplit("/", 2)[1] == viabackwards.rsplit("/", 2)[1]  # same release
 
 
 def test_settings_split_comma_separated_lists():

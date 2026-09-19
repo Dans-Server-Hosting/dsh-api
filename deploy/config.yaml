@@ -10,7 +10,9 @@ data:
   DSH_MAX_SERVERS_PER_TENANT: "1"
   DSH_ADMIN_USERS: "dmccoystephenson" # comma-separated logins that may read feedback
   # Comma-separated plugin download URLs every new server is installed with.
-  DSH_DEFAULT_PLUGINS: "https://github.com/Dans-Plugins/Dans-Plugin-Manager/releases/download/v0.7.0-SNAPSHOT-8-8-2026/DansPluginManager-0.7.0-SNAPSHOT-8-8-2026.jar"
+  # Dan's Plugin Manager, then ViaVersion + ViaBackwards so clients on other
+  # Minecraft versions can join. ViaBackwards depends on ViaVersion: both or neither.
+  DSH_DEFAULT_PLUGINS: "https://github.com/Dans-Plugins/Dans-Plugin-Manager/releases/download/v0.7.0-SNAPSHOT-8-8-2026/DansPluginManager-0.7.0-SNAPSHOT-8-8-2026.jar,https://github.com/ViaVersion/ViaVersion/releases/download/5.12.0/ViaVersion-5.12.0.jar,https://github.com/ViaVersion/ViaBackwards/releases/download/5.12.0/ViaBackwards-5.12.0.jar"
   DSH_DB_PATH: /data/dsh-api.db
   DSH_BACKUP_DIR: /backups
   OMCSI_CHART_DIR: /opt/omcsi
