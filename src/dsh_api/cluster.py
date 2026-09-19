@@ -191,6 +191,43 @@ def run_command(
     return proc.stdout if isinstance(proc.stdout, str) else ""
 
 
+def pvc_reader_pod_overrides(claim: str) -> dict:
+    """A restricted-profile-compatible pod that idles with a tenant's world
+    PVC mounted read-only, for ``kubectl exec ... tar``. uid/gid/fsGroup 1000
+    match the wrapper's, so the world's files are readable; the limits fit
+    beside an awake release under the hosted-free quota."""
+    return {
+        "spec": {
+            "restartPolicy": "Never",
+            "securityContext": {
+                "runAsNonRoot": True,
+                "runAsUser": 1000,
+                "runAsGroup": 1000,
+                "fsGroup": 1000,
+                "seccompProfile": {"type": "RuntimeDefault"},
+            },
+            "containers": [
+                {
+                    "name": "r",
+                    "image": "busybox:1.36",
+                    "command": ["sleep", "3600"],
+                    "securityContext": {
+                        "allowPrivilegeEscalation": False,
+                        "readOnlyRootFilesystem": True,
+                        "capabilities": {"drop": ["ALL"]},
+                    },
+                    "resources": {
+                        "requests": {"cpu": "50m", "memory": "64Mi"},
+                        "limits": {"cpu": "400m", "memory": "256Mi"},
+                    },
+                    "volumeMounts": [{"name": "w", "mountPath": "/mcserver", "readOnly": True}],
+                }
+            ],
+            "volumes": [{"name": "w", "persistentVolumeClaim": {"claimName": claim}}],
+        }
+    }
+
+
 def tenant_namespace_manifests(name: str) -> dict:
     """The namespace, quota and limit range of the hosted-free profile."""
     ns = namespace_for(name)
@@ -561,29 +598,48 @@ class KubectlHelmBackend:
             self._run(
                 ["kubectl", "-n", ns, "get", "pvc", f"{name}{WRAPPER_PVC_SUFFIX}", "-o", "name"]
             )
-            overrides = {
-                "spec": {
-                    "containers": [
-                        {
-                            "name": "r",
-                            "image": "busybox:1.36",
-                            "command": tar,
-                            "stdin": True,
-                            "volumeMounts": [{"name": "w", "mountPath": "/mcserver"}],
-                        }
-                    ],
-                    "volumes": [
-                        {
-                            "name": "w",
-                            "persistentVolumeClaim": {"claimName": f"{name}{WRAPPER_PVC_SUFFIX}"},
-                        }
-                    ],
-                }
-            }
-            argv = [
-                "kubectl", "-n", ns, "run", "backup-reader", "--rm", "-i", "--restart=Never",
-                "--image=busybox:1.36", f"--overrides={json.dumps(overrides)}",
-            ]  # fmt: skip
+            # ``kubectl run -i --rm`` cannot stream this reliably: it attaches
+            # only once the container is Running, and tar of a small world is
+            # finished before that, so kubectl sits in "timed out waiting for
+            # the condition" for a minute and the file holds a few bytes. The
+            # pod idles instead, and ``kubectl exec`` streams tar from the
+            # first byte to the last (the operator scripts do the same).
+            pod = f"backup-reader-{stamp.lower()}"
+            self._run(
+                [
+                    "kubectl",
+                    "-n",
+                    ns,
+                    "run",
+                    pod,
+                    "--restart=Never",
+                    "--image=busybox:1.36",
+                    f"--overrides={json.dumps(pvc_reader_pod_overrides(f'{name}{WRAPPER_PVC_SUFFIX}'))}",
+                ]  # fmt: skip
+            )
+            try:
+                self._run(
+                    [
+                        "kubectl",
+                        "-n",
+                        ns,
+                        "wait",
+                        "--for=condition=Ready",
+                        f"pod/{pod}",
+                        "--timeout=120s",
+                    ]  # fmt: skip
+                )
+                argv = ["kubectl", "-n", ns, "exec", pod, "--", *tar]
+                return self._stream_backup(argv, path)
+            finally:
+                # Best effort: a pod that will not go away is a leak, not a failure.
+                try:
+                    self._run(["kubectl", "-n", ns, "delete", "pod", pod, "--wait=false"])
+                except ClusterError:
+                    pass
+        return self._stream_backup(argv, path)
+
+    def _stream_backup(self, argv: list[str], path: Path) -> Path:
         try:
             self._run(argv, stdout_path=path)
         except ClusterError:
