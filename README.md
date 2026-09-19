@@ -176,7 +176,7 @@ split in two (`deploy/rbac.yaml`):
 | ClusterRole | Bound | Holds |
 |---|---|---|
 | `dsh-api-cluster` | cluster-wide, by a ClusterRoleBinding | only what has to work before a tenant namespace has a binding: `namespaces` (get/list/create/patch/delete); `resourcequotas` and `limitranges` (create/get/patch/delete — namespaced, but applied in the same step as the namespace); `rolebindings` (create/get/patch); and the `bind` verb on **one** ClusterRole, `dsh-api-tenant`, by `resourceNames` |
-| `dsh-api-tenant` | per tenant, by a RoleBinding the API creates in `t-<name>` | the namespaced rules helm and the backend actually use: secrets, configmaps, services, serviceaccounts, persistentvolumeclaims, pods, `pods/exec`, `pods/log`, events, deployments, statefulsets, `statefulsets/scale`, horizontalpodautoscalers, ingresses, networkpolicies |
+| `dsh-api-tenant` | per tenant, by a RoleBinding the API creates in `t-<name>` | the namespaced rules helm and the backend actually use: secrets, configmaps, services, serviceaccounts, persistentvolumeclaims, pods, `pods/exec`, `pods/log`, events, deployments, statefulsets, `statefulsets/scale`, horizontalpodautoscalers, ingresses, networkpolicies, roles, rolebindings (the chart's dashboard Role) |
 
 Creating a server therefore goes: namespace + quota + limit range (cluster
 role), then the RoleBinding `dsh-api` in the new namespace binding

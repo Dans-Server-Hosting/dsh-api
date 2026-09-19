@@ -201,6 +201,22 @@ def test_tenant_rolebinding_binds_the_tenant_clusterrole_to_the_api():
     assert "name: dsh-api-tenant" in rbac
 
 
+def test_tenant_role_can_manage_the_charts_role_and_rolebinding():
+    """OMCSI renders a Role + RoleBinding for the dashboard; helm must be able
+    to create them on install and remove them on uninstall, or the release is
+    left ``uninstalling`` and DELETE fails after the backup (2026-09-19).
+    Read as text: pyyaml is not a dependency of this project."""
+    rbac = (Path(__file__).parent.parent / "deploy" / "rbac.yaml").read_text()
+    tenant = rbac.split("name: dsh-api-tenant", 1)[1].split("\n---", 1)[0]
+    rule = next(
+        block
+        for block in tenant.split("- apiGroups:")
+        if "[rbac.authorization.k8s.io]" in block and "[roles, rolebindings]" in block
+    )
+    verbs = rule.split("verbs:", 1)[1].split("\n", 1)[0]
+    assert all(v in verbs for v in ("create", "delete", "get", "patch", "update"))
+
+
 def test_namespace_binding_and_credentials_are_applied_over_stdin(tmp_path):
     runner = Runner()
     be = KubectlHelmBackend(
