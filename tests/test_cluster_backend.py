@@ -487,6 +487,15 @@ def test_deleting_a_namespace_that_is_already_gone_is_not_an_error(tmp_path):
     be.delete_namespace("alpha")  # no raise
 
 
+def test_deleting_a_namespace_still_raises_for_other_not_found_errors(tmp_path):
+    runner = Runner(
+        ClusterError('kubectl delete failed: Error from server (NotFound): pods "x" not found')
+    )
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
+    with pytest.raises(ClusterError, match='pods "x" not found'):
+        be.delete_namespace("alpha")
+
+
 def test_backup_of_an_awake_server_execs_tar(tmp_path):
     runner = Runner("tarball-bytes")
     be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)

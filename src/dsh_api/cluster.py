@@ -663,7 +663,17 @@ class KubectlHelmBackend:
         try:
             self._run(["kubectl", "delete", "namespace", namespace_for(name), "--wait=false"])
         except ClusterError as exc:
-            if "NotFound" not in str(exc) and "not found" not in str(exc):
+            text = str(exc).lower()
+            ns = namespace_for(name)
+            if (
+                "notfound" not in text
+                and "not found" not in text
+                or (
+                    f'namespaces "{ns}" not found' not in text
+                    and f'namespace "{ns}" not found' not in text
+                    and f"namespace/{ns} not found" not in text
+                )
+            ):
                 raise
 
 
