@@ -17,7 +17,7 @@ from dsh_api.cluster import (
 from dsh_api.config import DEFAULT_PLUGINS, Settings, split_csv
 from dsh_api.db import Database
 from dsh_api.main import create_app
-from dsh_api.service import STATES, WAKE_GRACE, server_state
+from dsh_api.service import STATES, WAKE_GRACE, ServerService, server_state
 
 ALICE = {"Authorization": "Bearer alice-token"}
 BOB = {"Authorization": "Bearer bob-token"}
@@ -549,6 +549,18 @@ def test_wake_of_a_failed_server_reports_the_failure(client, cluster, created):
     assert len(cluster.ops) == n_ops
 
 
+def test_wake_of_a_server_whose_statefulset_is_gone_reports_the_failure(client, cluster, created):
+    """The release was removed behind the API's back: ``GET`` says ``failed``,
+    and ``wake`` must say the same rather than scale a StatefulSet that is not
+    there (a 502 from kubectl)."""
+    del cluster.wrappers["alpha"]
+    n_ops = len(cluster.ops)
+    resp = client.post("/api/v1/servers/alpha/wake", headers=ALICE)
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["state"] == "failed"
+    assert cluster.ops[n_ops:] == []  # no scale attempted
+
+
 def test_wake_start_failure_is_502(client, cluster, created):
     cluster.stop_game("alpha")
     cluster.fail_on.add("start_wrapper")
@@ -657,6 +669,53 @@ def test_delete_retry_after_a_failure_past_the_backup_reuses_that_backup(
     assert kinds.count("backup") == 1  # no second tarball was attempted successfully
 
 
+def test_delete_retry_reuses_a_backup_when_kubectl_reports_the_missing_pvc_singularly(
+    client, cluster, created, db
+):
+    cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
+    cluster.fail_on.add("uninstall_release")
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 502
+    taken = [e["detail"] for e in db.events("alpha") if e["kind"] == "backup"]
+    cluster.fail_on.discard("uninstall_release")
+
+    def backup_world(name: str, awake: bool):
+        raise ClusterError(f"persistentvolumeclaim/{name}-omcsi-mcserver not found")
+
+    cluster.backup_world = backup_world
+    retry = client.delete("/api/v1/servers/alpha", headers=ALICE)
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["backup"] == taken[0]
+    assert [e["kind"] for e in db.events("alpha")][-2:] == ["backup.reused", "delete"]
+
+
+def test_latest_reused_backup_is_considered_reusable(
+    settings, db, cluster, resolver, jobs, created
+):
+    cluster.backup_dir.mkdir(parents=True, exist_ok=True)
+    original = cluster.backup_dir / "old.tar.gz"
+    original.write_bytes(b"old")
+    db.record("alice", "alpha", "backup", str(original))
+    original.unlink()
+    reused = cluster.backup_dir / "new.tar.gz"
+    reused.write_bytes(b"new")
+    db.record("alice", "alpha", "backup.reused", str(reused))
+    service = ServerService(settings, db, cluster, resolver, jobs)
+    assert service._backup_still_on_disk("alpha") == str(reused)
+
+
+def test_older_existing_backup_is_used_when_the_latest_recorded_one_is_gone(
+    settings, db, cluster, resolver, jobs, created
+):
+    cluster.backup_dir.mkdir(parents=True, exist_ok=True)
+    older = cluster.backup_dir / "older.tar.gz"
+    older.write_bytes(b"older")
+    missing = cluster.backup_dir / "missing.tar.gz"
+    db.record("alice", "alpha", "backup", str(older))
+    db.record("alice", "alpha", "backup.reused", str(missing))
+    service = ServerService(settings, db, cluster, resolver, jobs)
+    assert service._backup_still_on_disk("alpha") == str(older)
+
+
 def test_delete_retry_does_not_reuse_a_backup_that_is_gone_from_disk(client, cluster, created, db):
     cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
     cluster.fail_on.add("uninstall_release")
@@ -667,6 +726,23 @@ def test_delete_retry_does_not_reuse_a_backup_that_is_gone_from_disk(client, clu
     cluster.releases.pop("alpha")
     assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 502
     assert client.get("/api/v1/servers/alpha", headers=ALICE).status_code == 200  # still there
+
+
+def test_delete_retry_does_not_reuse_a_backup_for_an_unrelated_not_found(
+    client, cluster, created, db
+):
+    cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
+    cluster.fail_on.add("uninstall_release")
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 502
+    cluster.fail_on.discard("uninstall_release")
+
+    def backup_world(name: str, awake: bool):
+        raise ClusterError("exec failed: container not found")
+
+    cluster.backup_world = backup_world
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 502
+    assert client.get("/api/v1/servers/alpha", headers=ALICE).status_code == 200
+    assert [e["kind"] for e in db.events("alpha")].count("backup.reused") == 0
 
 
 def test_after_delete_the_name_can_be_reused(client, cluster, created):
