@@ -17,7 +17,7 @@ from dsh_api.cluster import (
 from dsh_api.config import DEFAULT_PLUGINS, Settings, split_csv
 from dsh_api.db import Database
 from dsh_api.main import create_app
-from dsh_api.service import STATES, WAKE_GRACE, server_state
+from dsh_api.service import STATES, WAKE_GRACE, ServerService, server_state
 
 ALICE = {"Authorization": "Bearer alice-token"}
 BOB = {"Authorization": "Bearer bob-token"}
@@ -686,6 +686,21 @@ def test_delete_retry_reuses_a_backup_when_kubectl_reports_the_missing_pvc_singu
     assert retry.status_code == 200, retry.text
     assert retry.json()["backup"] == taken[0]
     assert [e["kind"] for e in db.events("alpha")][-2:] == ["backup.reused", "delete"]
+
+
+def test_latest_reused_backup_is_considered_reusable(
+    settings, db, cluster, resolver, jobs, created
+):
+    cluster.backup_dir.mkdir(parents=True, exist_ok=True)
+    original = cluster.backup_dir / "old.tar.gz"
+    original.write_bytes(b"old")
+    db.record("alice", "alpha", "backup", str(original))
+    original.unlink()
+    reused = cluster.backup_dir / "new.tar.gz"
+    reused.write_bytes(b"new")
+    db.record("alice", "alpha", "backup.reused", str(reused))
+    service = ServerService(settings, db, cluster, resolver, jobs)
+    assert service._backup_still_on_disk("alpha") == str(reused)
 
 
 def test_delete_retry_does_not_reuse_a_backup_that_is_gone_from_disk(client, cluster, created, db):
