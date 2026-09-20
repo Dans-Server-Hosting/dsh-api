@@ -201,6 +201,22 @@ def test_tenant_rolebinding_binds_the_tenant_clusterrole_to_the_api():
     assert "name: dsh-api-tenant" in rbac
 
 
+def test_tenant_role_can_manage_the_charts_role_and_rolebinding():
+    """OMCSI renders a Role + RoleBinding for the dashboard; helm must be able
+    to create them on install and remove them on uninstall, or the release is
+    left ``uninstalling`` and DELETE fails after the backup (2026-09-19).
+    Read as text: pyyaml is not a dependency of this project."""
+    rbac = (Path(__file__).parent.parent / "deploy" / "rbac.yaml").read_text()
+    tenant = rbac.split("name: dsh-api-tenant", 1)[1].split("\n---", 1)[0]
+    rule = next(
+        block
+        for block in tenant.split("- apiGroups:")
+        if "[rbac.authorization.k8s.io]" in block and "[roles, rolebindings]" in block
+    )
+    verbs = rule.split("verbs:", 1)[1].split("\n", 1)[0]
+    assert all(v in verbs for v in ("create", "delete", "get", "patch", "update"))
+
+
 def test_namespace_binding_and_credentials_are_applied_over_stdin(tmp_path):
     runner = Runner()
     be = KubectlHelmBackend(
@@ -440,6 +456,37 @@ def test_http_json_is_none_on_timeout_or_refused_connection():
     assert http_json(f"http://127.0.0.1:{port}/api/server/status", timeout=0.5) is None
 
 
+def test_uninstall_of_a_release_that_is_already_gone_is_not_an_error(tmp_path):
+    """helm: ``uninstall: Release not loaded: x: release: not found``. A delete
+    retried after an earlier attempt (or the operator) removed the release must
+    carry on to the namespace and the row (example, 2026-09-19)."""
+    runner = Runner(
+        ClusterError(
+            "helm uninstall failed: Error: uninstall: Release not loaded: alpha: release: not found"
+        )
+    )
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
+    be.uninstall_release("alpha")  # no raise
+    assert runner.calls[0][0] == ["helm", "uninstall", "alpha", "-n", "t-alpha"]
+
+
+def test_uninstall_failing_for_any_other_reason_still_raises(tmp_path):
+    runner = Runner(ClusterError("helm uninstall failed: Error: failed to delete release: alpha"))
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
+    with pytest.raises(ClusterError, match="failed to delete release"):
+        be.uninstall_release("alpha")
+
+
+def test_deleting_a_namespace_that_is_already_gone_is_not_an_error(tmp_path):
+    runner = Runner(
+        ClusterError(
+            'kubectl delete failed: Error from server (NotFound): namespaces "t-alpha" not found'
+        )
+    )
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
+    be.delete_namespace("alpha")  # no raise
+
+
 def test_backup_of_an_awake_server_execs_tar(tmp_path):
     runner = Runner("tarball-bytes")
     be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
@@ -453,24 +500,79 @@ def test_backup_of_an_awake_server_execs_tar(tmp_path):
                     "tar", "-C", "/mcserver", "-czf", "-", "."]  # fmt: skip
 
 
-def test_backup_of_an_asleep_server_mounts_the_pvc_in_a_throwaway_pod(tmp_path):
-    runner = Runner("persistentvolumeclaim/alpha-omcsi-mcserver\n", "tarball-bytes")
+def test_backup_of_an_asleep_server_mounts_the_pvc_in_an_idle_pod_and_execs_tar(tmp_path):
+    runner = Runner(
+        "persistentvolumeclaim/alpha-omcsi-mcserver\n",  # get pvc
+        "pod/backup-reader created\n",  # run
+        "pod/backup-reader condition met\n",  # wait
+        "tarball-bytes",  # exec tar
+        "pod deleted\n",  # delete
+    )
     be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
-    be.backup_world("alpha", awake=False)
+    path = be.backup_world("alpha", awake=False)
+    assert path.read_bytes() == b"tarball-bytes"
     # The claim is looked up first, so a missing one fails fast instead of
     # leaving a reader pod Pending.
     assert runner.calls[0][0] == ["kubectl", "-n", "t-alpha", "get", "pvc", "alpha-omcsi-mcserver",
                                   "-o", "name"]  # fmt: skip
-    argv = runner.calls[1][0]
-    assert argv[:9] == ["kubectl", "-n", "t-alpha", "run", "backup-reader", "--rm", "-i",
-                        "--restart=Never", "--image=busybox:1.36"]  # fmt: skip
-    overrides = json.loads(argv[9].removeprefix("--overrides="))
+    # ``kubectl run -i --rm`` is not used: it attaches after the container is
+    # Running and misses a tar that has already finished (a minute of "timed
+    # out waiting for the condition" and a 53-byte file, seen live 2026-09-19).
+    run_argv = runner.calls[1][0]
+    assert run_argv[:4] == ["kubectl", "-n", "t-alpha", "run"]
+    pod = run_argv[4]
+    assert pod.startswith("backup-reader-")
+    assert "-i" not in run_argv and "--rm" not in run_argv
+    overrides = json.loads(run_argv[-1].removeprefix("--overrides="))
     container = overrides["spec"]["containers"][0]
-    assert container["command"] == ["tar", "-C", "/mcserver", "-czf", "-", "."]
-    assert container["stdin"] is True
+    assert container["command"] == ["sleep", "3600"]  # idles; exec does the work
+    assert container["volumeMounts"][0]["readOnly"] is True
     assert overrides["spec"]["volumes"][0]["persistentVolumeClaim"]["claimName"] == (
         "alpha-omcsi-mcserver"
     )
+    # Restricted-profile compatible: the operator script labels tenant
+    # namespaces enforce=restricted, and the API's own warn=restricted.
+    assert overrides["spec"]["securityContext"]["runAsNonRoot"] is True
+    assert overrides["spec"]["securityContext"]["seccompProfile"] == {"type": "RuntimeDefault"}
+    assert container["securityContext"]["allowPrivilegeEscalation"] is False
+    assert container["securityContext"]["capabilities"] == {"drop": ["ALL"]}
+    assert runner.calls[2][0] == ["kubectl", "-n", "t-alpha", "wait", "--for=condition=Ready",
+                                  f"pod/{pod}", "--timeout=120s"]  # fmt: skip
+    exec_argv, _, stdout_path = runner.calls[3]
+    assert exec_argv == ["kubectl", "-n", "t-alpha", "exec", pod, "--",
+                         "tar", "-C", "/mcserver", "-czf", "-", "."]  # fmt: skip
+    assert stdout_path == path
+    assert runner.calls[4][0] == ["kubectl", "-n", "t-alpha", "delete", "pod", pod,
+                                  "--wait=false"]  # fmt: skip
+
+
+def test_reader_pod_is_deleted_even_when_tar_fails(tmp_path):
+    runner = Runner(
+        "persistentvolumeclaim/alpha-omcsi-mcserver\n",
+        "pod created\n",
+        "condition met\n",
+        ClusterError("exec failed: container not found"),
+        "pod deleted\n",
+    )
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
+    with pytest.raises(ClusterError, match="exec failed"):
+        be.backup_world("alpha", awake=False)
+    assert runner.calls[-1][0][:5] == ["kubectl", "-n", "t-alpha", "delete", "pod"]
+    assert list((tmp_path / "b").iterdir()) == []
+
+
+def test_reader_pod_is_deleted_when_it_never_becomes_ready(tmp_path):
+    runner = Runner(
+        "persistentvolumeclaim/alpha-omcsi-mcserver\n",
+        "pod created\n",
+        ClusterError("timed out waiting for the condition"),
+        "pod deleted\n",
+    )
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
+    with pytest.raises(ClusterError, match="timed out"):
+        be.backup_world("alpha", awake=False)
+    assert [c[0][3] for c in runner.calls] == ["get", "run", "wait", "delete"]
+    assert list((tmp_path / "b").iterdir()) == []
 
 
 def test_backup_of_a_server_without_a_world_volume_fails_fast(tmp_path):
@@ -491,7 +593,13 @@ def test_empty_backup_is_refused_and_removed(tmp_path):
 
 
 def test_failed_backup_leaves_no_file(tmp_path):
-    runner = Runner("persistentvolumeclaim/alpha-omcsi-mcserver\n", ClusterError("boom"))
+    runner = Runner(
+        "persistentvolumeclaim/alpha-omcsi-mcserver\n",
+        "pod created\n",
+        "condition met\n",
+        ClusterError("boom"),
+        "pod deleted\n",
+    )
     be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
     with pytest.raises(ClusterError, match="boom"):
         be.backup_world("alpha", awake=False)

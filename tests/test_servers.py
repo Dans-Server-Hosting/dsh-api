@@ -14,7 +14,7 @@ from dsh_api.cluster import (
     StatefulSetStatus,
     WrapperStatus,
 )
-from dsh_api.config import DEFAULT_PLUGINS, Settings
+from dsh_api.config import DEFAULT_PLUGINS, Settings, split_csv
 from dsh_api.db import Database
 from dsh_api.main import create_app
 from dsh_api.service import STATES, WAKE_GRACE, server_state
@@ -57,7 +57,7 @@ def test_create_provisions_like_the_operator_script(client, cluster, created):
         hostname="alpha.play.example.com",
         sslip_hostname="alpha.203-0-113-10.sslip.io",
         motd="alpha on Dan's Server Hosting",
-        default_plugins=(DEFAULT_PLUGINS,),  # Dan's Plugin Manager, like the operator's script
+        default_plugins=split_csv(DEFAULT_PLUGINS),  # DPM + Via pair, like the operator script
     )
 
 
@@ -639,6 +639,46 @@ def test_force_delete_tolerates_an_impossible_backup(client, cluster, created, d
     assert resp.json()["backup"] is None
     assert "t-alpha" not in cluster.namespaces
     assert "backup.skipped" in [e["kind"] for e in db.events("alpha")]
+
+
+def test_delete_retry_after_a_failure_past_the_backup_reuses_that_backup(
+    client, cluster, created, db
+):
+    """Seen live 2026-09-19: helm removed the world volume, then failed on an
+    object the API could not delete; every retry then 502'd on the missing PVC
+    while a good backup sat on disk. The retry must use it and finish."""
+    cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)  # asleep
+    cluster.fail_on.add("uninstall_release")
+    first = client.delete("/api/v1/servers/alpha", headers=ALICE)
+    assert first.status_code == 502
+    taken = [e["detail"] for e in db.events("alpha") if e["kind"] == "backup"]
+    assert len(taken) == 1 and (cluster.backup_dir / taken[0].rsplit("/", 1)[1]).exists()
+
+    # helm's partial uninstall took the release (and with it the PVC) even
+    # though it reported failure; the API's row still says ready.
+    cluster.fail_on.discard("uninstall_release")
+    cluster.releases.pop("alpha")
+    assert client.get("/api/v1/servers/alpha", headers=ALICE).status_code == 200
+
+    retry = client.delete("/api/v1/servers/alpha", headers=ALICE)
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["backup"] == taken[0]
+    assert "t-alpha" not in cluster.namespaces
+    kinds = [e["kind"] for e in db.events("alpha")]
+    assert kinds[-2:] == ["backup.reused", "delete"]
+    assert kinds.count("backup") == 1  # no second tarball was attempted successfully
+
+
+def test_delete_retry_does_not_reuse_a_backup_that_is_gone_from_disk(client, cluster, created, db):
+    cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
+    cluster.fail_on.add("uninstall_release")
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 502
+    for path in cluster.backup_dir.iterdir():
+        path.unlink()  # retention swept it, say
+    cluster.fail_on.discard("uninstall_release")
+    cluster.releases.pop("alpha")
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 502
+    assert client.get("/api/v1/servers/alpha", headers=ALICE).status_code == 200  # still there
 
 
 def test_after_delete_the_name_can_be_reused(client, cluster, created):

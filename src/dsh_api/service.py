@@ -7,6 +7,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Protocol
 
 from dsh_api.cluster import (
@@ -301,15 +302,32 @@ class ServerService:
             backup = str(self.cluster.backup_world(name, awake=awake))
             self.db.record(tenant_id, name, "backup", backup)
         except ClusterError as exc:
-            # Without force the world is never removed unbacked-up. With force,
-            # or for a failed create (a release that never installed has
-            # nothing to read), it may be.
-            if not force and row.status != "failed":
+            prior = self._backup_still_on_disk(name)
+            if prior is not None and "not found" in str(exc).lower():
+                # A retry of a delete that failed after its backup: helm took
+                # the world's volume (or the pod) with the release on the way
+                # down, so there is nothing left to read, and that backup is
+                # the backup (example, 2026-09-19: helm could not remove the
+                # chart's Role, and every retry 502'd on the missing PVC).
+                backup = prior
+                self.db.record(tenant_id, name, "backup.reused", prior)
+            elif not force and row.status != "failed":
+                # Without force the world is never removed unbacked-up. With
+                # force, or for a failed create (a release that never installed
+                # has nothing to read), it may be.
                 raise
-            backup = None
-            self.db.record(tenant_id, name, "backup.skipped", str(exc))
+            else:
+                backup = None
+                self.db.record(tenant_id, name, "backup.skipped", str(exc))
         self.cluster.uninstall_release(name)
         self.cluster.delete_namespace(name)
         self.db.delete_server(name)
         self.db.record(tenant_id, name, "delete")
         return backup
+
+    def _backup_still_on_disk(self, name: str) -> str | None:
+        """The newest backup this server's own delete took, if the file is still there."""
+        for event in reversed(self.db.events(name)):
+            if event["kind"] == "backup":
+                return event["detail"] if Path(event["detail"]).exists() else None
+        return None

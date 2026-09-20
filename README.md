@@ -69,11 +69,13 @@ never fails a list or get.
 |---|---|---|
 | `GET` | `/healthz` | liveness |
 | `GET` | `/api/v1/limits` | free-tier profile as numbers; no token needed |
+| `GET` | `/api/v1/default-plugins` | the plugins every new server is installed with, in install order (`name`, `version`, `description`, `download_url`, `project_url`); no token needed |
 | `GET` | `/api/v1/servers` | the caller's servers |
 | `POST` | `/api/v1/servers` | `{name, motd?, operator_username?}` → **202** with the server in state `provisioning`; the admin password is in this response **only**. 409 `{"detail": "a server is already being created for this account", "server": "<name>"}` while the caller's earlier create is still running; 409 when the name is taken; 403 at the tenant cap |
 | `GET` | `/api/v1/servers/{name}` | one server, with `players_online` when `awake` (`null` otherwise) |
+<<<<<<< HEAD
 | `POST` | `/api/v1/servers/{name}/wake` | 202 with the resulting server: `asleep` → scales the wrapper to 1; `stopped` → `POST /api/server/start` on the wrapper; `waking`/`awake`/`failed` → no-op (a failed server, including one whose StatefulSet is gone, is reported as such rather than scaled) |
-| `DELETE` | `/api/v1/servers/{name}` | backup, `helm uninstall`, namespace delete; 409 while players are online unless `?force=true`; 409 while the server is still `provisioning`; a `failed` create is removed even when there is nothing to back up |
+| `DELETE` | `/api/v1/servers/{name}` | backup, `helm uninstall`, namespace delete; 409 while players are online unless `?force=true`; 409 while the server is still `provisioning`; a `failed` create is removed even when there is nothing to back up; a retry after a delete that failed past its backup reuses that backup when the world volume is already gone |
 | `GET` | `/api/v1/me` | `{username, is_admin}` for the caller; admins are the `DSH_ADMIN_USERS` logins |
 | `POST` | `/api/v1/feedback` | `{message (1–4000 chars), page?}` → 201; any signed-in user, at most 10 per user per hour (429) |
 | `GET` | `/api/v1/feedback?status=new\|read\|all` | admin only (403 otherwise); newest first, default `new` |
@@ -88,9 +90,10 @@ never finish), one wake, then the wrapper, webapp and nginx rollouts (up to
 `DSH_ROLLOUT_TIMEOUT` each). Poll `GET /api/v1/servers/{name}` until `state`
 leaves `provisioning`; expect a few minutes. The release is installed with
 `minecraftWrapper.env.DEFAULT_PLUGINS` set from `DSH_DEFAULT_PLUGINS`, so a new
-server starts with Dan's Plugin Manager the way the operator's script installs
-it (commas in the list are escaped for `helm --set`, which would otherwise
-split them).
+server starts with Dan's Plugin Manager plus ViaVersion and ViaBackwards (so
+clients on other Minecraft versions can join), the same set the operator's
+script installs (commas in the list are escaped for `helm --set`, which would
+otherwise split them).
 
 ### Contract note for the portal
 
@@ -104,6 +107,11 @@ split them).
   cap `403` is unchanged and only ever means the account is full.
 - A `failed` server may be a create that failed: it still counts against the
   cap, and `DELETE` (no `force` needed) is how the account gets its slot back.
+- `GET /api/v1/default-plugins` is what to show for "what comes installed":
+  it is derived from `DSH_DEFAULT_PLUGINS`, so it is always what a new server
+  actually gets. `description` is empty and `project_url` is `null` for a
+  plugin the API does not know (see `KNOWN_PLUGINS` in `plugins.py`); show
+  the name and version and omit the rest.
 
 ## Running locally
 
@@ -135,7 +143,7 @@ OMCSI checkout at `OMCSI_CHART_DIR` (the image provides all three).
 | `DSH_SERVICE_ACCOUNT_NAME` | `dsh-api` | the ServiceAccount the per-tenant RoleBinding is made out to; the Deployment sets it from `spec.serviceAccountName` |
 | `DSH_MAX_SERVERS_PER_TENANT` | `1` | the cap behind the 403 |
 | `DSH_ADMIN_USERS` | `dmccoystephenson` | comma-separated JWT `sub`s that may read and triage feedback |
-| `DSH_DEFAULT_PLUGINS` | Dan's Plugin Manager `0.7.0-SNAPSHOT-8-8-2026` release jar | comma-separated plugin download URLs every new server is installed with; empty for none |
+| `DSH_DEFAULT_PLUGINS` | Dan's Plugin Manager `0.7.0-SNAPSHOT-8-8-2026`, ViaVersion `5.12.0`, ViaBackwards `5.12.0` release jars | comma-separated plugin download URLs every new server is installed with; empty for none. Also what `GET /api/v1/default-plugins` describes |
 | `DSH_LIMIT_HEAP_GB` | `3` | free-tier profile served by `GET /api/v1/limits` |
 | `DSH_LIMIT_MEMORY_LIMIT_GIB` | `3.5` | " |
 | `DSH_LIMIT_WORLD_QUOTA_GIB` | `5` | " |
@@ -170,7 +178,7 @@ split in two (`deploy/rbac.yaml`):
 | ClusterRole | Bound | Holds |
 |---|---|---|
 | `dsh-api-cluster` | cluster-wide, by a ClusterRoleBinding | only what has to work before a tenant namespace has a binding: `namespaces` (get/list/create/patch/delete); `resourcequotas` and `limitranges` (create/get/patch/delete — namespaced, but applied in the same step as the namespace); `rolebindings` (create/get/patch); and the `bind` verb on **one** ClusterRole, `dsh-api-tenant`, by `resourceNames` |
-| `dsh-api-tenant` | per tenant, by a RoleBinding the API creates in `t-<name>` | the namespaced rules helm and the backend actually use: secrets, configmaps, services, serviceaccounts, persistentvolumeclaims, pods, `pods/exec`, `pods/attach`, `pods/log`, events, deployments, statefulsets, `statefulsets/scale`, horizontalpodautoscalers, ingresses, networkpolicies |
+| `dsh-api-tenant` | per tenant, by a RoleBinding the API creates in `t-<name>` | the namespaced rules helm and the backend actually use: secrets, configmaps, services, serviceaccounts, persistentvolumeclaims, pods, `pods/exec`, `pods/log`, events, deployments, statefulsets, `statefulsets/scale`, horizontalpodautoscalers, ingresses, networkpolicies, roles, rolebindings (the chart's dashboard Role) |
 
 Creating a server therefore goes: namespace + quota + limit range (cluster
 role), then the RoleBinding `dsh-api` in the new namespace binding

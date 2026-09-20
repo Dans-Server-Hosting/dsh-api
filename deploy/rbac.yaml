@@ -59,10 +59,11 @@ rules:
   - apiGroups: [""]
     resources: [pods]
     verbs: [get, list, watch, create, delete]
-  # exec for the backup of an awake server; attach for the throwaway reader
-  # pod (``kubectl run -i --rm``) that backs up an asleep one.
+  # exec for the backup of an awake server (the wrapper pod) and of an asleep
+  # one (an idle reader pod with the world PVC mounted; the API creates,
+  # waits for and deletes it, hence the pod verbs above).
   - apiGroups: [""]
-    resources: [pods/exec, pods/attach]
+    resources: [pods/exec]
     verbs: [create]
   - apiGroups: [""]
     resources: [pods/log, events]
@@ -78,6 +79,15 @@ rules:
     verbs: [get, list, watch, create, patch, update, delete]
   - apiGroups: [networking.k8s.io]
     resources: [ingresses, networkpolicies]
+    verbs: [get, list, watch, create, patch, update, delete]
+  # The chart (OMCSI main since #293) renders a Role + RoleBinding so the
+  # dashboard can scale the wrapper. Creating a Role needs every permission it
+  # grants (statefulsets get, statefulsets/scale get+patch — held above), so
+  # no ``escalate``. Without ``delete`` here, ``helm uninstall`` removes every
+  # other object and then reports "failed to delete release", the release
+  # stays ``uninstalling`` and DELETE answers 502 (example, 2026-09-19).
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [roles, rolebindings]
     verbs: [get, list, watch, create, patch, update, delete]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
