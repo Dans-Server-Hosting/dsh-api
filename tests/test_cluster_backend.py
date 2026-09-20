@@ -490,6 +490,17 @@ def test_uninstall_of_a_release_that_is_already_gone_accepts_helm_other_not_foun
     be.uninstall_release("alpha")  # no raise
 
 
+def test_uninstall_still_raises_for_other_release_not_loaded_errors(tmp_path):
+    runner = Runner(
+        ClusterError(
+            "helm uninstall failed: Error: uninstall: release not loaded: alpha: failed to decode"
+        )
+    )
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
+    with pytest.raises(ClusterError, match="failed to decode"):
+        be.uninstall_release("alpha")
+
+
 def test_uninstall_failing_for_any_other_reason_still_raises(tmp_path):
     runner = Runner(ClusterError("helm uninstall failed: Error: failed to delete release: alpha"))
     be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)

@@ -703,6 +703,19 @@ def test_latest_reused_backup_is_considered_reusable(
     assert service._backup_still_on_disk("alpha") == str(reused)
 
 
+def test_older_existing_backup_is_used_when_the_latest_recorded_one_is_gone(
+    settings, db, cluster, resolver, jobs, created
+):
+    cluster.backup_dir.mkdir(parents=True, exist_ok=True)
+    older = cluster.backup_dir / "older.tar.gz"
+    older.write_bytes(b"older")
+    missing = cluster.backup_dir / "missing.tar.gz"
+    db.record("alice", "alpha", "backup", str(older))
+    db.record("alice", "alpha", "backup.reused", str(missing))
+    service = ServerService(settings, db, cluster, resolver, jobs)
+    assert service._backup_still_on_disk("alpha") == str(older)
+
+
 def test_delete_retry_does_not_reuse_a_backup_that_is_gone_from_disk(client, cluster, created, db):
     cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
     cluster.fail_on.add("uninstall_release")

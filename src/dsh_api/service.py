@@ -336,5 +336,6 @@ class ServerService:
         """The newest backup this server's own delete took, if the file is still there."""
         for event in reversed(self.db.events(name)):
             if event["kind"] in {"backup", "backup.reused"}:
-                return event["detail"] if Path(event["detail"]).exists() else None
+                if Path(event["detail"]).exists():
+                    return event["detail"]
         return None

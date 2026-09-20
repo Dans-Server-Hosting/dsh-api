@@ -657,7 +657,9 @@ class KubectlHelmBackend:
             self._run(["helm", "uninstall", name, "-n", namespace_for(name)])
         except ClusterError as exc:
             text = str(exc).lower()
-            if "release: not found" not in text and "release not loaded:" not in text:
+            if "not found" not in text or (
+                "release: not found" not in text and "release not loaded:" not in text
+            ):
                 raise
 
     def delete_namespace(self, name: str) -> None:
