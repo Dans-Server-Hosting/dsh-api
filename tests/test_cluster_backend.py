@@ -470,6 +470,16 @@ def test_uninstall_of_a_release_that_is_already_gone_is_not_an_error(tmp_path):
     assert runner.calls[0][0] == ["helm", "uninstall", "alpha", "-n", "t-alpha"]
 
 
+def test_uninstall_of_a_release_that_is_already_gone_is_case_insensitive(tmp_path):
+    runner = Runner(
+        ClusterError(
+            "helm uninstall failed: Error: uninstall: Release not loaded: alpha: Release: Not Found"
+        )
+    )
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
+    be.uninstall_release("alpha")  # no raise
+
+
 def test_uninstall_failing_for_any_other_reason_still_raises(tmp_path):
     runner = Runner(ClusterError("helm uninstall failed: Error: failed to delete release: alpha"))
     be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
