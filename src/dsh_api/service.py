@@ -303,7 +303,7 @@ class ServerService:
             self.db.record(tenant_id, name, "backup", backup)
         except ClusterError as exc:
             prior = self._backup_still_on_disk(name)
-            if prior is not None and "not found" in str(exc).lower():
+            if prior is not None and self._world_backup_source_is_gone(exc):
                 # A retry of a delete that failed after its backup: helm took
                 # the world's volume (or the pod) with the release on the way
                 # down, so there is nothing left to read, and that backup is
@@ -324,6 +324,11 @@ class ServerService:
         self.db.delete_server(name)
         self.db.record(tenant_id, name, "delete")
         return backup
+
+    @staticmethod
+    def _world_backup_source_is_gone(exc: ClusterError) -> bool:
+        text = str(exc).lower()
+        return "persistentvolumeclaims" in text and "not found" in text
 
     def _backup_still_on_disk(self, name: str) -> str | None:
         """The newest backup this server's own delete took, if the file is still there."""

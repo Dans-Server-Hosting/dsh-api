@@ -681,6 +681,23 @@ def test_delete_retry_does_not_reuse_a_backup_that_is_gone_from_disk(client, clu
     assert client.get("/api/v1/servers/alpha", headers=ALICE).status_code == 200  # still there
 
 
+def test_delete_retry_does_not_reuse_a_backup_for_an_unrelated_not_found(
+    client, cluster, created, db
+):
+    cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
+    cluster.fail_on.add("uninstall_release")
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 502
+    cluster.fail_on.discard("uninstall_release")
+
+    def backup_world(name: str, awake: bool):
+        raise ClusterError("exec failed: container not found")
+
+    cluster.backup_world = backup_world
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 502
+    assert client.get("/api/v1/servers/alpha", headers=ALICE).status_code == 200
+    assert [e["kind"] for e in db.events("alpha")].count("backup.reused") == 0
+
+
 def test_after_delete_the_name_can_be_reused(client, cluster, created):
     cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
     assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 200
