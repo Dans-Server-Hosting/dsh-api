@@ -10,6 +10,7 @@ release URL, and a one-line description for the plugins the service knows.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from urllib.parse import urlparse
 
@@ -69,5 +70,5 @@ def describe_plugin(url: str) -> DefaultPlugin:
     )
 
 
-def describe_default_plugins(urls: tuple[str, ...]) -> list[dict]:
+def describe_default_plugins(urls: Iterable[str]) -> list[dict]:
     return [asdict(describe_plugin(url)) for url in urls]
