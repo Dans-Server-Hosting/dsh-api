@@ -328,7 +328,9 @@ class ServerService:
     @staticmethod
     def _world_backup_source_is_gone(exc: ClusterError) -> bool:
         text = str(exc).lower()
-        return "persistentvolumeclaims" in text and "not found" in text
+        return "not found" in text and (
+            "persistentvolumeclaims" in text or "persistentvolumeclaim/" in text
+        )
 
     def _backup_still_on_disk(self, name: str) -> str | None:
         """The newest backup this server's own delete took, if the file is still there."""

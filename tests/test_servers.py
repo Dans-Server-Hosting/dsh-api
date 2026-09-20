@@ -669,6 +669,25 @@ def test_delete_retry_after_a_failure_past_the_backup_reuses_that_backup(
     assert kinds.count("backup") == 1  # no second tarball was attempted successfully
 
 
+def test_delete_retry_reuses_a_backup_when_kubectl_reports_the_missing_pvc_singularly(
+    client, cluster, created, db
+):
+    cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
+    cluster.fail_on.add("uninstall_release")
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 502
+    taken = [e["detail"] for e in db.events("alpha") if e["kind"] == "backup"]
+    cluster.fail_on.discard("uninstall_release")
+
+    def backup_world(name: str, awake: bool):
+        raise ClusterError(f"persistentvolumeclaim/{name}-omcsi-mcserver not found")
+
+    cluster.backup_world = backup_world
+    retry = client.delete("/api/v1/servers/alpha", headers=ALICE)
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["backup"] == taken[0]
+    assert [e["kind"] for e in db.events("alpha")][-2:] == ["backup.reused", "delete"]
+
+
 def test_delete_retry_does_not_reuse_a_backup_that_is_gone_from_disk(client, cluster, created, db):
     cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
     cluster.fail_on.add("uninstall_release")
