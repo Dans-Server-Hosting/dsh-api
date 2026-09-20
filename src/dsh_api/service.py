@@ -333,7 +333,7 @@ class ServerService:
         )
 
     def _backup_still_on_disk(self, name: str) -> str | None:
-        """The newest backup this server's own delete took, if the file is still there."""
+        """The newest recorded backup path for this server that still exists on disk."""
         for event in reversed(self.db.events(name)):
             if event["kind"] in {"backup", "backup.reused"}:
                 if Path(event["detail"]).exists():
