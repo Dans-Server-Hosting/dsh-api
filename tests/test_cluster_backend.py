@@ -470,6 +470,37 @@ def test_uninstall_of_a_release_that_is_already_gone_is_not_an_error(tmp_path):
     assert runner.calls[0][0] == ["helm", "uninstall", "alpha", "-n", "t-alpha"]
 
 
+def test_uninstall_of_a_release_that_is_already_gone_is_case_insensitive(tmp_path):
+    runner = Runner(
+        ClusterError(
+            "helm uninstall failed: Error: uninstall: Release not loaded: alpha: Release: Not Found"
+        )
+    )
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
+    be.uninstall_release("alpha")  # no raise
+
+
+def test_uninstall_of_a_release_that_is_already_gone_accepts_helm_other_not_found_wording(tmp_path):
+    runner = Runner(
+        ClusterError(
+            "helm uninstall failed: Error: uninstall: release not loaded: alpha: not found"
+        )
+    )
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
+    be.uninstall_release("alpha")  # no raise
+
+
+def test_uninstall_still_raises_for_other_release_not_loaded_errors(tmp_path):
+    runner = Runner(
+        ClusterError(
+            "helm uninstall failed: Error: uninstall: release not loaded: alpha: failed to decode"
+        )
+    )
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
+    with pytest.raises(ClusterError, match="failed to decode"):
+        be.uninstall_release("alpha")
+
+
 def test_uninstall_failing_for_any_other_reason_still_raises(tmp_path):
     runner = Runner(ClusterError("helm uninstall failed: Error: failed to delete release: alpha"))
     be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
@@ -485,6 +516,15 @@ def test_deleting_a_namespace_that_is_already_gone_is_not_an_error(tmp_path):
     )
     be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
     be.delete_namespace("alpha")  # no raise
+
+
+def test_deleting_a_namespace_still_raises_for_other_not_found_errors(tmp_path):
+    runner = Runner(
+        ClusterError('kubectl delete failed: Error from server (NotFound): pods "x" not found')
+    )
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
+    with pytest.raises(ClusterError, match='pods "x" not found'):
+        be.delete_namespace("alpha")
 
 
 def test_backup_of_an_awake_server_execs_tar(tmp_path):

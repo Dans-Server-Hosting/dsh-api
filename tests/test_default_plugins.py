@@ -45,6 +45,11 @@ def test_every_shipped_default_is_known_and_pinned():
     assert all(p["description"] and p["version"] and p["project_url"] for p in described)
 
 
+def test_default_plugin_description_accepts_any_iterable():
+    described = describe_default_plugins([DPM, VIAVERSION])
+    assert [p["name"] for p in described] == ["Dan's Plugin Manager", "ViaVersion"]
+
+
 def test_default_plugins_endpoint_is_public_and_ordered(client):
     resp = client.get("/api/v1/default-plugins")
     assert resp.status_code == 200

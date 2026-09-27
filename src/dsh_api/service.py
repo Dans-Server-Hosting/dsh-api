@@ -257,13 +257,18 @@ class ServerService:
         """Scale an asleep wrapper up, or start the game on a stopped one.
 
         A waking or awake server is left alone, as is a failed one (scaling a
-        crash-looping pod does nothing useful; the failure is reported instead).
+        crash-looping pod does nothing useful, and a StatefulSet that is gone
+        cannot be scaled at all; the failure is reported instead).
         """
         row = self._owned(tenant_id, name)
         if row.status != "ready":
             # Still being created, or the create failed: nothing to scale yet.
             return self._view(row, with_players=False)
         sts = self.cluster.statefulset_status(name)
+        if sts.state == "failed":
+            # A missing StatefulSet has zero replicas too; the scale below would
+            # only turn what GET reports as ``failed`` into a 502 from kubectl.
+            return self._view(row, with_players=False)
         if sts.replicas < 1:
             self.cluster.scale_wrapper(name, 1)
             self.db.mark_woken(name)
@@ -298,7 +303,7 @@ class ServerService:
             self.db.record(tenant_id, name, "backup", backup)
         except ClusterError as exc:
             prior = self._backup_still_on_disk(name)
-            if prior is not None and "not found" in str(exc).lower():
+            if prior is not None and self._world_backup_source_is_gone(exc):
                 # A retry of a delete that failed after its backup: helm took
                 # the world's volume (or the pod) with the release on the way
                 # down, so there is nothing left to read, and that backup is
@@ -320,9 +325,17 @@ class ServerService:
         self.db.record(tenant_id, name, "delete")
         return backup
 
+    @staticmethod
+    def _world_backup_source_is_gone(exc: ClusterError) -> bool:
+        text = str(exc).lower()
+        return "not found" in text and (
+            "persistentvolumeclaims" in text or "persistentvolumeclaim/" in text
+        )
+
     def _backup_still_on_disk(self, name: str) -> str | None:
-        """The newest backup this server's own delete took, if the file is still there."""
+        """The newest recorded backup path for this server that still exists on disk."""
         for event in reversed(self.db.events(name)):
-            if event["kind"] == "backup":
-                return event["detail"] if Path(event["detail"]).exists() else None
+            if event["kind"] in {"backup", "backup.reused"}:
+                if Path(event["detail"]).exists():
+                    return event["detail"]
         return None

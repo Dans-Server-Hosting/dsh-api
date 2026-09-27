@@ -23,10 +23,10 @@
 
 ## Done when
 
-1. [ ] With a valid UserAuth token, `POST /api/v1/servers` results in a server a player can join by hostname, and `GET` reports it `asleep` → `awake` as that happens. *Implemented and tested against the fake cluster; awaits the first deploy to be confirmed against the real one.*
+1. [x] With a valid UserAuth token, `POST /api/v1/servers` results in a server a player can join by hostname, and `GET` reports it `asleep` → `awake` as that happens. *Confirmed on the real cluster on 2026-09-14: a create driven through the public API with a UserAuth-issued token reached `awake` in about 95 s.*
 2. [x] A second tenant cannot see or delete the first tenant's server.
-3. [x] `DELETE` produces a backup file before the namespace goes. *Ordering verified against the fake; the `kubectl exec` / PVC-reader command lines are asserted, the real transfer awaits a deploy.*
-4. [ ] The API is reachable at `api.<domain>` through Traefik with a real certificate once the domain exists (self-signed before). *Manifests in `deploy/`; needs applying to the cluster.*
+3. [x] `DELETE` produces a backup file before the namespace goes. *Ordering verified against the fake; the `kubectl exec` / PVC-reader command lines are asserted, and the real transfer was confirmed on 2026-09-14 (delete in about 16 s with the world backed up first).*
+4. [x] The API is reachable at `api.<domain>` through Traefik with a real certificate once the domain exists (self-signed before). *Applied on 2026-09-14; `https://api.<domain>/healthz` answers with a Let's Encrypt certificate.*
 5. [x] Unit tests run without a cluster (the k8s/helm calls are behind one interface with a fake).
 
 *Since the MVP:* `state` is no longer read from the StatefulSet alone. The
