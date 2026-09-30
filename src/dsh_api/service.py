@@ -333,8 +333,15 @@ class ServerService:
         )
 
     def _backup_still_on_disk(self, name: str) -> str | None:
-        """The newest recorded backup path for this server that still exists on disk."""
+        """The newest recorded backup path for this server that still exists on disk.
+
+        Names are reused once a server is deleted, by any tenant, and backups
+        outlive their server; the scan stops at the last ``delete`` so an
+        earlier server's world is never handed out as this one's.
+        """
         for event in reversed(self.db.events(name)):
+            if event["kind"] == "delete":
+                break
             if event["kind"] in {"backup", "backup.reused"}:
                 if Path(event["detail"]).exists():
                     return event["detail"]
