@@ -745,6 +745,43 @@ def test_delete_retry_does_not_reuse_a_backup_for_an_unrelated_not_found(
     assert [e["kind"] for e in db.events("alpha")].count("backup.reused") == 0
 
 
+def test_backup_of_an_earlier_server_with_the_same_name_is_not_reusable(
+    settings, db, cluster, resolver, jobs, created
+):
+    cluster.backup_dir.mkdir(parents=True, exist_ok=True)
+    earlier = cluster.backup_dir / "earlier.tar.gz"
+    earlier.write_bytes(b"earlier")
+    db.record("alice", "alpha", "backup", str(earlier))
+    db.record("alice", "alpha", "delete")
+    db.record("bob", "alpha", "create.requested")
+    service = ServerService(settings, db, cluster, resolver, jobs)
+    assert service._backup_still_on_disk("alpha") is None
+
+
+def test_delete_of_a_reused_name_does_not_hand_out_another_tenants_backup(
+    client, cluster, jobs, created, db
+):
+    cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
+    first = client.delete("/api/v1/servers/alpha", headers=ALICE)
+    assert first.status_code == 200
+    alices_backup = first.json()["backup"]
+    assert alices_backup and (cluster.backup_dir / alices_backup.rsplit("/", 1)[1]).exists()
+
+    # bob takes the name; his create fails before helm makes a volume.
+    cluster.fail_on.add("install_release")
+    assert client.post("/api/v1/servers", json={"name": "alpha"}, headers=BOB).status_code == 202
+    jobs.run()
+    cluster.fail_on.discard("install_release")
+    assert client.get("/api/v1/servers/alpha", headers=BOB).json()["state"] == "failed"
+
+    resp = client.delete("/api/v1/servers/alpha", headers=BOB)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["backup"] is None
+    kinds = [e["kind"] for e in db.events("alpha")]
+    assert kinds.count("backup.reused") == 0
+    assert kinds[-2:] == ["backup.skipped", "delete"]
+
+
 def test_after_delete_the_name_can_be_reused(client, cluster, created):
     cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
     assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 200
