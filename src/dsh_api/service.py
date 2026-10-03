@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 
 NAME_PATTERN = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
 
-STATES = ("provisioning", "asleep", "waking", "awake", "stopped", "failed")
+STATES = ("provisioning", "asleep", "waking", "awake", "stopped", "failed", "deleting")
 
 WAKE_GRACE = timedelta(minutes=3)
 """How long after a scale-up a not-yet-running game still counts as waking."""
@@ -67,7 +67,7 @@ def validate_name(name: str) -> str:
 
 
 class JobRunner(Protocol):
-    """Where the provisioning steps run after ``POST`` has answered.
+    """Where the provisioning and delete steps run after the request has answered.
 
     ``concurrent.futures.ThreadPoolExecutor`` is the real one; the tests pass
     one that queues the job and runs it when they say so.
@@ -132,15 +132,22 @@ class ServerService:
         self.jobs = jobs
 
     def recover_interrupted(self) -> None:
-        """Rows left ``provisioning`` by a process that died mid-create.
+        """Rows left ``provisioning`` or ``deleting`` by a process that died mid-job.
 
-        The job ran in this process, so nothing is still working on them: they
-        are marked failed (the namespace and release stay for inspection) so the
-        tenant can see what happened and DELETE to free the slot.
+        The job ran in this process, so nothing is still working on them. An
+        interrupted create is marked failed (the namespace and release stay for
+        inspection) so the tenant can see what happened and DELETE to free the
+        slot; an interrupted delete is put back as it was.
         """
-        for row in self.db.list_provisioning():
+        for row in self.db.list_with_status("provisioning"):
             self.db.set_status(row.name, "failed")
             self.db.record(row.tenant_id, row.name, "create.interrupted", "the API restarted")
+        # A delete cut short goes back to what the row was before it, so the
+        # tenant sees the server again and can DELETE it once more (a retry
+        # reuses a backup already taken when the world volume is gone).
+        for row in self.db.list_with_status("deleting"):
+            self.db.set_status(row.name, self._status_before_delete(row.name))
+            self.db.record(row.tenant_id, row.name, "delete.interrupted", "the API restarted")
 
     # --- reads ---------------------------------------------------------------
 
@@ -279,17 +286,21 @@ class ServerService:
             self.db.record(tenant_id, name, "wake.start")
         return self._view(self.db.get_server(name) or row, with_players=False)
 
-    def delete(self, tenant_id: str, name: str, force: bool = False) -> str | None:
-        """Back up, uninstall, remove the namespace. Returns the backup path.
+    def delete(self, tenant_id: str, name: str, force: bool = False) -> ServerView:
+        """Accept the delete and start it; returns the view (state ``deleting``).
 
-        A server whose create is still in flight cannot be removed (the job is
-        still writing to it); one whose create failed can, and since it may
-        never have had a pod or a volume, a backup that cannot be taken is
-        skipped rather than fatal — as it is with ``force``.
+        Backup, uninstall and namespace removal take minutes for a large world,
+        so they run on ``jobs`` after this returns, and ``get``/``list`` report
+        ``deleting`` until the row is gone. What can be refused at once is:
+        a server whose create is still in flight (the job is still writing to
+        it), and one with players online unless ``force``. A second DELETE
+        while one is running answers with the server as it is.
         """
         row = self._owned(tenant_id, name)
         if row.status == "provisioning":
             raise CreateInProgress(name)
+        if row.status == "deleting":
+            return self._view(row, with_players=False)
         # The pod being up is what decides how the world is read (exec versus a
         # PVC reader); a stopped game still has its pod.
         awake = self.cluster.statefulset_status(name).state == "awake"
@@ -297,33 +308,77 @@ class ServerService:
             online = self.cluster.players_online(name) or 0
             if online > 0:
                 raise PlayersOnline(online)
-        backup: str | None
+        if self.db.begin_delete(name, row.status):
+            # The detail is the status to go back to if the delete fails.
+            self.db.record(tenant_id, name, "delete.requested", row.status)
+            self.jobs.submit(self._remove, tenant_id, name, row.status, awake, force)
+        return self._view(self.db.get_server(name) or row, with_players=False)
+
+    def _remove(self, tenant_id: str, name: str, prior: str, awake: bool, force: bool) -> None:
+        """The delete's cluster steps, off the request thread. Never raises:
+        a failure puts the row back to ``prior`` with the reason recorded
+        (``backup.failed`` or ``delete.failed``), and the tenant may retry."""
+        try:
+            try:
+                self._back_up_for_delete(tenant_id, name, prior, awake, force)
+            except ClusterError as exc:
+                self._delete_failed(tenant_id, name, prior, "backup.failed", str(exc))
+                return
+            self.cluster.uninstall_release(name)
+            self.cluster.delete_namespace(name)
+        except ClusterError as exc:
+            self._delete_failed(tenant_id, name, prior, "delete.failed", str(exc))
+            return
+        except Exception as exc:  # the thread must not die silently
+            log.exception("deleting %s failed unexpectedly", name)
+            self._delete_failed(
+                tenant_id, name, prior, "delete.failed", f"{type(exc).__name__}: {exc}"
+            )
+            return
+        self.db.delete_server(name)
+        self.db.record(tenant_id, name, "delete")
+
+    def _delete_failed(self, tenant_id: str, name: str, prior: str, kind: str, detail: str) -> None:
+        self.db.set_status(name, prior)
+        self.db.record(tenant_id, name, kind, detail)
+
+    def _back_up_for_delete(
+        self, tenant_id: str, name: str, prior: str, awake: bool, force: bool
+    ) -> str | None:
+        """Take the world's backup, or decide it may be done without.
+
+        Raises ``ClusterError`` when the world must not be removed unbacked-up.
+        One whose create failed may never have had a pod or a volume, so a
+        backup that cannot be taken is skipped rather than fatal — as it is
+        with ``force``.
+        """
         try:
             backup = str(self.cluster.backup_world(name, awake=awake))
             self.db.record(tenant_id, name, "backup", backup)
+            return backup
         except ClusterError as exc:
-            prior = self._backup_still_on_disk(name)
-            if prior is not None and self._world_backup_source_is_gone(exc):
+            prior_backup = self._backup_still_on_disk(name)
+            if prior_backup is not None and self._world_backup_source_is_gone(exc):
                 # A retry of a delete that failed after its backup: helm took
                 # the world's volume (or the pod) with the release on the way
                 # down, so there is nothing left to read, and that backup is
                 # the backup (example, 2026-09-19: helm could not remove the
                 # chart's Role, and every retry 502'd on the missing PVC).
-                backup = prior
-                self.db.record(tenant_id, name, "backup.reused", prior)
-            elif not force and row.status != "failed":
+                self.db.record(tenant_id, name, "backup.reused", prior_backup)
+                return prior_backup
+            if not force and prior != "failed":
                 # Without force the world is never removed unbacked-up. With
                 # force, or for a failed create (a release that never installed
                 # has nothing to read), it may be.
                 raise
-            else:
-                backup = None
-                self.db.record(tenant_id, name, "backup.skipped", str(exc))
-        self.cluster.uninstall_release(name)
-        self.cluster.delete_namespace(name)
-        self.db.delete_server(name)
-        self.db.record(tenant_id, name, "delete")
-        return backup
+            self.db.record(tenant_id, name, "backup.skipped", str(exc))
+            return None
+
+    def _status_before_delete(self, name: str) -> str:
+        for event in reversed(self.db.events(name)):
+            if event["kind"] == "delete.requested":
+                return event["detail"] if event["detail"] in ("ready", "failed") else "ready"
+        return "ready"
 
     @staticmethod
     def _world_backup_source_is_gone(exc: ClusterError) -> bool:

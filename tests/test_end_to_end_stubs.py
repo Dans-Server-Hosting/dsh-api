@@ -147,8 +147,11 @@ def test_create_get_and_delete_through_real_subprocesses(stubbed):
     )
 
     resp = client.delete("/api/v1/servers/alpha", headers=auth)
-    assert resp.status_code == 200, resp.text
-    backup = Path(resp.json()["backup"])
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["state"] == "deleting"
+    assert jobs.run() == 1
+    assert client.get("/api/v1/servers/alpha", headers=auth).status_code == 404
+    (backup,) = Path(client.app.state.settings.backup_dir).iterdir()
     assert backup.read_bytes() == b"pretend-tarball"
     tail = [[os.path.basename(c["argv"][0]), *c["argv"][1:]] for c in calls(log)[-3:]]
     assert "exec" in tail[0]

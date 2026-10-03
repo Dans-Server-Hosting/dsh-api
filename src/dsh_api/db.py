@@ -50,9 +50,10 @@ MIGRATIONS = {
     ("servers", "status"): "ALTER TABLE servers ADD COLUMN status TEXT NOT NULL DEFAULT 'ready'",
 }
 
-ROW_STATUSES = ("provisioning", "ready", "failed")
+ROW_STATUSES = ("provisioning", "ready", "failed", "deleting")
 """What the row says about the create: in flight, done (the cluster decides the
-state from here on), or failed (the row keeps the tenant's slot until DELETE)."""
+state from here on), or failed (the row keeps the tenant's slot until DELETE);
+or that a DELETE was accepted and its steps are still running."""
 
 
 def now_iso() -> str:
@@ -163,10 +164,10 @@ class Database:
             ).fetchone()
         return ServerRow(**row) if row else None
 
-    def list_provisioning(self) -> list[ServerRow]:
+    def list_with_status(self, status: str) -> list[ServerRow]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM servers WHERE status = 'provisioning' ORDER BY created_at, name"
+                "SELECT * FROM servers WHERE status = ? ORDER BY created_at, name", (status,)
             ).fetchall()
         return [ServerRow(**r) for r in rows]
 
@@ -175,6 +176,16 @@ class Database:
             raise ValueError(f"unknown server status {status!r}")
         with self._connect() as conn:
             conn.execute("UPDATE servers SET status = ? WHERE name = ?", (status, name))
+
+    def begin_delete(self, name: str, current: str) -> bool:
+        """Move the row from ``current`` to ``deleting``; False when another
+        request got there first (or the row changed under it)."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE servers SET status = 'deleting' WHERE name = ? AND status = ?",
+                (name, current),
+            )
+        return cur.rowcount == 1
 
     def mark_woken(self, name: str) -> None:
         with self._connect() as conn:
