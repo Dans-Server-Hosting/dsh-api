@@ -247,14 +247,13 @@ def test_delete_of_a_failed_create_frees_the_slot(client, cluster, jobs, db, ste
     client.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE)
     jobs.run()
     resp = client.delete("/api/v1/servers/alpha", headers=ALICE)
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 202, resp.text
+    assert jobs.run() == 1
     kinds = [e["kind"] for e in db.events("alpha")]
     if step == "install_release":
         # No release, so no world volume: the backup is skipped, not fatal.
-        assert resp.json()["backup"] is None
-        assert "backup.skipped" in kinds
+        assert "backup.skipped" in kinds and "backup" not in kinds
     else:
-        assert resp.json()["backup"]
         assert "backup" in kinds
     assert [op[0] for op in cluster.ops[-2:]] == ["uninstall_release", "delete_namespace"]
     assert "t-alpha" not in cluster.namespaces
@@ -276,7 +275,9 @@ def test_provisioning_left_over_by_a_restart_is_marked_failed(settings, cluster,
     assert body["state"] == "failed"
     assert db.events("alpha")[-1]["kind"] == "create.interrupted"
     # ... and the tenant is not stuck: the failed server can be removed.
-    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 200
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 202
+    assert jobs.run() == 1
+    assert client.get("/api/v1/servers/alpha", headers=ALICE).status_code == 404
 
 
 def test_create_runs_on_a_real_thread_pool_by_default(settings, db, cluster, resolver):
@@ -576,13 +577,19 @@ def test_wake_unknown_server_is_404(client):
 # --- delete ------------------------------------------------------------------
 
 
-def test_delete_backs_up_before_the_namespace_goes(client, cluster, created, db):
+def taken_backups(db, name="alpha") -> list[str]:
+    """The backup paths recorded for ``name``, taken or reused, oldest first."""
+    return [e["detail"] for e in db.events(name) if e["kind"] in ("backup", "backup.reused")]
+
+
+def test_delete_backs_up_before_the_namespace_goes(client, cluster, jobs, created, db):
     cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)  # asleep
     resp = client.delete("/api/v1/servers/alpha", headers=ALICE)
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body["deleted"] is True
-    backup = cluster.backup_dir / body["backup"].rsplit("/", 1)[1]
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["name"] == "alpha" and resp.json()["state"] == "deleting"
+    assert jobs.run() == 1
+    (taken,) = taken_backups(db)
+    backup = cluster.backup_dir / taken.rsplit("/", 1)[1]
     assert backup.exists() and backup.stat().st_size > 0
     assert backup.name.startswith("alpha-") and backup.name.endswith(".tar.gz")
 
@@ -595,63 +602,161 @@ def test_delete_backs_up_before_the_namespace_goes(client, cluster, created, db)
     assert "alpha" not in cluster.releases
     assert client.get("/api/v1/servers/alpha", headers=ALICE).status_code == 404
     assert client.get("/api/v1/servers", headers=ALICE).json() == []
-    assert [e["kind"] for e in db.events("alpha")][-2:] == ["backup", "delete"]
+    assert [e["kind"] for e in db.events("alpha")][-3:] == ["delete.requested", "backup", "delete"]
 
 
-def test_delete_of_an_awake_server_uses_exec(client, cluster, created):
+def test_delete_answers_202_and_removes_in_the_background(client, cluster, jobs, created, db):
+    cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
+    n_ops = len(cluster.ops)
+    resp = client.delete("/api/v1/servers/alpha", headers=ALICE)
+    assert resp.status_code == 202
+    assert len(jobs.pending) == 1
+    # Nothing destructive has happened yet: the request only read the cluster.
+    assert not any(
+        op[0] in ("backup_world", "uninstall_release", "delete_namespace")
+        for op in cluster.ops[n_ops:]
+    )
+    assert client.get("/api/v1/servers/alpha", headers=ALICE).json()["state"] == "deleting"
+    assert client.get("/api/v1/servers", headers=ALICE).json()[0]["state"] == "deleting"
+    # Wake has nothing to do with a server on its way out.
+    resp = client.post("/api/v1/servers/alpha/wake", headers=ALICE)
+    assert resp.status_code == 202 and resp.json()["state"] == "deleting"
+    # A second DELETE answers with the server as it is and queues nothing more.
+    resp = client.delete("/api/v1/servers/alpha", headers=ALICE)
+    assert resp.status_code == 202 and resp.json()["state"] == "deleting"
+    assert len(jobs.pending) == 1
+    # Until the row is gone it holds the name and the tenant's slot.
+    assert client.post("/api/v1/servers", json={"name": "alpha"}, headers=BOB).status_code == 409
+    assert client.post("/api/v1/servers", json={"name": "other"}, headers=ALICE).status_code == 403
+    assert jobs.run() == 1
+    assert client.get("/api/v1/servers/alpha", headers=ALICE).status_code == 404
+
+
+def test_delete_of_an_awake_server_uses_exec(client, cluster, jobs, created):
     cluster.players["alpha"] = 0
-    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 200
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 202
+    jobs.run()
     assert ("backup_world", "alpha", True) in cluster.ops
 
 
-def test_delete_of_a_stopped_server_still_execs_into_its_pod(client, cluster, created):
+def test_delete_of_a_stopped_server_still_execs_into_its_pod(client, cluster, jobs, created):
     cluster.stop_game("alpha")
-    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 200
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 202
+    jobs.run()
     assert ("backup_world", "alpha", True) in cluster.ops
 
 
-def test_delete_refuses_while_players_are_online_unless_forced(client, cluster, created):
+def test_delete_refuses_while_players_are_online_unless_forced(client, cluster, jobs, created):
     cluster.players["alpha"] = 2
     resp = client.delete("/api/v1/servers/alpha", headers=ALICE)
     assert resp.status_code == 409
     assert "2 player" in resp.json()["detail"]
-    assert "t-alpha" in cluster.namespaces
-    assert not any(op[0] == "backup_world" for op in cluster.ops)
+    assert jobs.pending == []
+    assert client.get("/api/v1/servers/alpha", headers=ALICE).json()["state"] == "awake"
 
     resp = client.delete("/api/v1/servers/alpha?force=true", headers=ALICE)
-    assert resp.status_code == 200
+    assert resp.status_code == 202
+    jobs.run()
     assert "t-alpha" not in cluster.namespaces
 
 
-def test_delete_without_a_backup_removes_nothing(client, cluster, created):
+def test_delete_without_a_backup_removes_nothing(client, cluster, jobs, created, db):
     cluster.fail_on.add("backup_world")
-    resp = client.delete("/api/v1/servers/alpha", headers=ALICE)
-    assert resp.status_code == 502
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 202
+    jobs.run()  # does not raise: the failure is recorded, not thrown
     assert "t-alpha" in cluster.namespaces
     assert "alpha" in cluster.releases
-    assert client.get("/api/v1/servers/alpha", headers=ALICE).status_code == 200
+    # The server is back as it was, with the reason recorded.
+    assert client.get("/api/v1/servers/alpha", headers=ALICE).json()["state"] == "awake"
+    assert db.get_server("alpha").status == "ready"
+    last = db.events("alpha")[-1]
+    assert last["kind"] == "backup.failed" and "backup_world" in last["detail"]
 
 
-def test_force_delete_tolerates_an_impossible_backup(client, cluster, created, db):
+def test_a_failure_past_the_backup_puts_the_server_back(client, cluster, jobs, created, db):
+    cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
+    cluster.fail_on.add("delete_namespace")
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 202
+    jobs.run()
+    assert db.get_server("alpha").status == "ready"
+    last = db.events("alpha")[-1]
+    assert last["kind"] == "delete.failed" and "delete_namespace" in last["detail"]
+    # ... and the tenant can try again.
+    cluster.fail_on.discard("delete_namespace")
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 202
+    jobs.run()
+    assert client.get("/api/v1/servers/alpha", headers=ALICE).status_code == 404
+
+
+def test_an_unexpected_error_in_the_delete_job_puts_the_server_back(
+    client, cluster, jobs, created, db
+):
+    def boom(name):
+        raise RuntimeError("helm vanished")
+
+    cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
+    cluster.uninstall_release = boom  # type: ignore[method-assign]
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 202
+    jobs.run()  # does not raise: the thread must not die with the row left deleting
+    assert db.get_server("alpha").status == "ready"
+    last = db.events("alpha")[-1]
+    assert (last["kind"], last["detail"]) == ("delete.failed", "RuntimeError: helm vanished")
+
+
+def test_a_failed_delete_of_a_failed_create_leaves_it_failed(client, cluster, jobs, db):
+    cluster.fail_on.add("wait_for_rollout")
+    client.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE)
+    jobs.run()
+    cluster.fail_on.add("delete_namespace")
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 202
+    jobs.run()
+    assert client.get("/api/v1/servers/alpha", headers=ALICE).json()["state"] == "failed"
+    assert db.get_server("alpha").status == "failed"
+
+
+@pytest.mark.parametrize("prior", ["ready", "failed"])
+def test_delete_left_over_by_a_restart_is_put_back(settings, cluster, resolver, jobs, prior):
+    db = Database(settings.db_path)
+    db.ensure_tenant("alice")
+    db.insert_server("alpha", "alice", "alpha.play.example.com", "m", None, status=prior)
+    assert db.begin_delete("alpha", prior)
+    db.record("alice", "alpha", "delete.requested", prior)
+    validator = FakeValidator({"alice-token": "alice"})
+    create_app(settings, db=db, cluster=cluster, validator=validator, uuids=resolver, jobs=jobs)
+    assert db.get_server("alpha").status == prior
+    assert db.events("alpha")[-1]["kind"] == "delete.interrupted"
+
+
+def test_begin_delete_lets_only_one_request_through(db):
+    db.ensure_tenant("alice")
+    db.insert_server("alpha", "alice", "alpha.play.example.com", "m", None, status="ready")
+    assert db.begin_delete("alpha", "ready") is True
+    assert db.begin_delete("alpha", "ready") is False
+    assert db.get_server("alpha").status == "deleting"
+
+
+def test_force_delete_tolerates_an_impossible_backup(client, cluster, jobs, created, db):
     cluster.fail_on.add("backup_world")
     resp = client.delete("/api/v1/servers/alpha?force=true", headers=ALICE)
-    assert resp.status_code == 200
-    assert resp.json()["backup"] is None
+    assert resp.status_code == 202
+    jobs.run()
+    assert taken_backups(db) == []
     assert "t-alpha" not in cluster.namespaces
     assert "backup.skipped" in [e["kind"] for e in db.events("alpha")]
 
 
 def test_delete_retry_after_a_failure_past_the_backup_reuses_that_backup(
-    client, cluster, created, db
+    client, cluster, jobs, created, db
 ):
     """Seen live 2026-09-19: helm removed the world volume, then failed on an
-    object the API could not delete; every retry then 502'd on the missing PVC
+    object the API could not delete; every retry then failed on the missing PVC
     while a good backup sat on disk. The retry must use it and finish."""
     cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)  # asleep
     cluster.fail_on.add("uninstall_release")
-    first = client.delete("/api/v1/servers/alpha", headers=ALICE)
-    assert first.status_code == 502
-    taken = [e["detail"] for e in db.events("alpha") if e["kind"] == "backup"]
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 202
+    jobs.run()
+    assert db.events("alpha")[-1]["kind"] == "delete.failed"
+    taken = taken_backups(db)
     assert len(taken) == 1 and (cluster.backup_dir / taken[0].rsplit("/", 1)[1]).exists()
 
     # helm's partial uninstall took the release (and with it the PVC) even
@@ -660,9 +765,9 @@ def test_delete_retry_after_a_failure_past_the_backup_reuses_that_backup(
     cluster.releases.pop("alpha")
     assert client.get("/api/v1/servers/alpha", headers=ALICE).status_code == 200
 
-    retry = client.delete("/api/v1/servers/alpha", headers=ALICE)
-    assert retry.status_code == 200, retry.text
-    assert retry.json()["backup"] == taken[0]
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 202
+    jobs.run()
+    assert taken_backups(db) == [taken[0], taken[0]]
     assert "t-alpha" not in cluster.namespaces
     kinds = [e["kind"] for e in db.events("alpha")]
     assert kinds[-2:] == ["backup.reused", "delete"]
@@ -670,21 +775,23 @@ def test_delete_retry_after_a_failure_past_the_backup_reuses_that_backup(
 
 
 def test_delete_retry_reuses_a_backup_when_kubectl_reports_the_missing_pvc_singularly(
-    client, cluster, created, db
+    client, cluster, jobs, created, db
 ):
     cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
     cluster.fail_on.add("uninstall_release")
-    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 502
-    taken = [e["detail"] for e in db.events("alpha") if e["kind"] == "backup"]
+    client.delete("/api/v1/servers/alpha", headers=ALICE)
+    jobs.run()
+    taken = taken_backups(db)
     cluster.fail_on.discard("uninstall_release")
 
     def backup_world(name: str, awake: bool):
         raise ClusterError(f"persistentvolumeclaim/{name}-omcsi-mcserver not found")
 
     cluster.backup_world = backup_world
-    retry = client.delete("/api/v1/servers/alpha", headers=ALICE)
-    assert retry.status_code == 200, retry.text
-    assert retry.json()["backup"] == taken[0]
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 202
+    jobs.run()
+    assert client.get("/api/v1/servers/alpha", headers=ALICE).status_code == 404
+    assert taken_backups(db)[-1] == taken[0]
     assert [e["kind"] for e in db.events("alpha")][-2:] == ["backup.reused", "delete"]
 
 
@@ -716,31 +823,39 @@ def test_older_existing_backup_is_used_when_the_latest_recorded_one_is_gone(
     assert service._backup_still_on_disk("alpha") == str(older)
 
 
-def test_delete_retry_does_not_reuse_a_backup_that_is_gone_from_disk(client, cluster, created, db):
+def test_delete_retry_does_not_reuse_a_backup_that_is_gone_from_disk(
+    client, cluster, jobs, created, db
+):
     cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
     cluster.fail_on.add("uninstall_release")
-    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 502
+    client.delete("/api/v1/servers/alpha", headers=ALICE)
+    jobs.run()
     for path in cluster.backup_dir.iterdir():
         path.unlink()  # retention swept it, say
     cluster.fail_on.discard("uninstall_release")
     cluster.releases.pop("alpha")
-    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 502
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 202
+    jobs.run()
+    assert db.events("alpha")[-1]["kind"] == "backup.failed"
     assert client.get("/api/v1/servers/alpha", headers=ALICE).status_code == 200  # still there
 
 
 def test_delete_retry_does_not_reuse_a_backup_for_an_unrelated_not_found(
-    client, cluster, created, db
+    client, cluster, jobs, created, db
 ):
     cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
     cluster.fail_on.add("uninstall_release")
-    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 502
+    client.delete("/api/v1/servers/alpha", headers=ALICE)
+    jobs.run()
     cluster.fail_on.discard("uninstall_release")
 
     def backup_world(name: str, awake: bool):
         raise ClusterError("exec failed: container not found")
 
     cluster.backup_world = backup_world
-    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 502
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 202
+    jobs.run()
+    assert db.events("alpha")[-1]["kind"] == "backup.failed"
     assert client.get("/api/v1/servers/alpha", headers=ALICE).status_code == 200
     assert [e["kind"] for e in db.events("alpha")].count("backup.reused") == 0
 
@@ -762,10 +877,10 @@ def test_delete_of_a_reused_name_does_not_hand_out_another_tenants_backup(
     client, cluster, jobs, created, db
 ):
     cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
-    first = client.delete("/api/v1/servers/alpha", headers=ALICE)
-    assert first.status_code == 200
-    alices_backup = first.json()["backup"]
-    assert alices_backup and (cluster.backup_dir / alices_backup.rsplit("/", 1)[1]).exists()
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 202
+    jobs.run()
+    (alices_backup,) = taken_backups(db)
+    assert (cluster.backup_dir / alices_backup.rsplit("/", 1)[1]).exists()
 
     # bob takes the name; his create fails before helm makes a volume.
     cluster.fail_on.add("install_release")
@@ -774,17 +889,19 @@ def test_delete_of_a_reused_name_does_not_hand_out_another_tenants_backup(
     cluster.fail_on.discard("install_release")
     assert client.get("/api/v1/servers/alpha", headers=BOB).json()["state"] == "failed"
 
-    resp = client.delete("/api/v1/servers/alpha", headers=BOB)
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["backup"] is None
+    assert client.delete("/api/v1/servers/alpha", headers=BOB).status_code == 202
+    jobs.run()
+    assert client.get("/api/v1/servers/alpha", headers=BOB).status_code == 404
+    assert taken_backups(db) == [alices_backup]
     kinds = [e["kind"] for e in db.events("alpha")]
     assert kinds.count("backup.reused") == 0
     assert kinds[-2:] == ["backup.skipped", "delete"]
 
 
-def test_after_delete_the_name_can_be_reused(client, cluster, created):
+def test_after_delete_the_name_can_be_reused(client, cluster, jobs, created):
     cluster.wrappers["alpha"] = StatefulSetStatus(exists=True, replicas=0)
-    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 200
+    assert client.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 202
+    jobs.run()
     assert client.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE).status_code == 202
 
 

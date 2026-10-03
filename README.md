@@ -49,13 +49,17 @@ driven through the public API (see the MVP done-when list).
 | `awake` | 1 replica, pod Ready | `running: true` | joinable; `players_online` is reported on `GET /api/v1/servers/{name}` |
 | `stopped` | 1 replica, pod Ready | `running: false` | the game process exited (Stop in the dashboard, or a crash) while the pod stayed up; `wake` starts it in place |
 | `failed` | missing, or a pod in `CrashLoopBackOff` / `ImagePullBackOff` / `Failed` — or the create itself failed, whatever the cluster says | *(not asked)* | needs the operator; a failed create keeps the tenant's slot until `DELETE`, which works without a pod or volume to back up |
+| `deleting` | *(not asked)* | *(not asked)* | a `DELETE` was accepted and its backup, uninstall and namespace removal are still running; the server keeps its name and the tenant's slot until it is gone (404), `wake` is a no-op and a second `DELETE` answers with it as it is |
 
-`provisioning` and a failed create are read from the row, not the cluster:
-during the create the release may not exist yet, and after a failure the
-namespace and release are left as they are for inspection (the error is in
-the `events` table as `create.failed`). If the API restarts mid-create the
-row is marked failed on startup (`create.interrupted`); nothing is retried on
-its own.
+`provisioning`, `deleting` and a failed create are read from the row, not
+the cluster: during the create the release may not exist yet, and after a
+failure the namespace and release are left as they are for inspection (the
+error is in the `events` table as `create.failed`). If the API restarts
+mid-create the row is marked failed on startup (`create.interrupted`); nothing
+is retried on its own. A delete that fails puts the server back as it was
+(`ready` or a failed create) with the reason recorded as `backup.failed` or
+`delete.failed`, and so does a restart mid-delete (`delete.interrupted`); the
+tenant may `DELETE` again.
 
 The pod's readiness probe is the wrapper's Spring health, not the game's, so
 readiness alone cannot tell `awake` from `stopped`. When the wrapper cannot be
@@ -74,7 +78,7 @@ never fails a list or get.
 | `POST` | `/api/v1/servers` | `{name, motd?, operator_username?}` → **202** with the server in state `provisioning`; the admin password is in this response **only**. 409 `{"detail": "a server is already being created for this account", "server": "<name>"}` while the caller's earlier create is still running; 409 when the name is taken; 403 at the tenant cap |
 | `GET` | `/api/v1/servers/{name}` | one server, with `players_online` when `awake` (`null` otherwise) |
 | `POST` | `/api/v1/servers/{name}/wake` | 202 with the resulting server: `asleep` → scales the wrapper to 1; `stopped` → `POST /api/server/start` on the wrapper; `waking`/`awake`/`failed` → no-op (a failed server, including one whose StatefulSet is gone, is reported as such rather than scaled) |
-| `DELETE` | `/api/v1/servers/{name}` | backup, `helm uninstall`, namespace delete; 409 while players are online unless `?force=true`; 409 while the server is still `provisioning`; a `failed` create is removed even when there is nothing to back up; a retry after a delete that failed past its backup reuses that backup when the world volume is already gone |
+| `DELETE` | `/api/v1/servers/{name}` | **202** with the server in state `deleting`; backup, `helm uninstall` and namespace delete then run in the background, and `GET` answers 404 once they are done. 409 while players are online unless `?force=true`; 409 while the server is still `provisioning`; a `failed` create is removed even when there is nothing to back up; a retry after a delete that failed past its backup reuses that backup when the world volume is already gone |
 | `GET` | `/api/v1/me` | `{username, is_admin}` for the caller; admins are the `DSH_ADMIN_USERS` logins |
 | `POST` | `/api/v1/feedback` | `{message (1–4000 chars), page?}` → 201; any signed-in user, at most 10 per user per hour (429) |
 | `GET` | `/api/v1/feedback?status=new\|read\|all` | admin only (403 otherwise); newest first, default `new` |
@@ -106,6 +110,12 @@ otherwise split them).
   cap `403` is unchanged and only ever means the account is full.
 - A `failed` server may be a create that failed: it still counts against the
   cap, and `DELETE` (no `force` needed) is how the account gets its slot back.
+- `DELETE` is `202`, not `200`, and answers with the server in state
+  `deleting` instead of `{name, deleted, backup}`. Add `deleting` to the state
+  pill and keep polling the server until it is a 404 (gone); if it comes back
+  in its earlier state instead, the delete failed (most often the backup) and
+  nothing was removed. The players-online and still-provisioning 409s are
+  unchanged and still answered at once.
 - `GET /api/v1/default-plugins` is what to show for "what comes installed":
   it is derived from `DSH_DEFAULT_PLUGINS`, so it is always what a new server
   actually gets. `description` is empty and `project_url` is `null` for a
