@@ -75,8 +75,9 @@ def create_app(
     )
     validator = validator or Hs256Validator(settings.jwt_secret)
     uuids = uuids or MojangResolver()
-    # Provisioning runs off the request thread; two at a time is plenty for a
-    # node that hosts a dozen servers, and keeps kubectl/helm from piling up.
+    # Provisioning and deletes run off the request thread; two at a time is
+    # plenty for a node that hosts a dozen servers, and keeps kubectl/helm
+    # from piling up.
     jobs = jobs or ThreadPoolExecutor(max_workers=2, thread_name_prefix="dsh-provision")
     service = ServerService(settings, db, cluster, uuids, jobs)
     service.recover_interrupted()
@@ -167,12 +168,14 @@ def create_app(
         except ServerNotFound:
             raise HTTPException(404, "no such server") from None
 
-    @app.delete("/api/v1/servers/{name}")
+    @app.delete("/api/v1/servers/{name}", status_code=202)
     def delete_server(tenant: Tenant, name: str, force: bool = False) -> dict:
-        """Back up, uninstall and remove the namespace. Works for a ``failed``
-        create too (its backup is skipped when there is nothing to read)."""
+        """Accept the delete and answer at once; ``GET`` reports ``deleting``
+        while the backup, uninstall and namespace removal run, then 404. Works
+        for a ``failed`` create too (its backup is skipped when there is
+        nothing to read)."""
         try:
-            backup = service.delete(tenant, name, force=force)
+            return asdict(service.delete(tenant, name, force=force))
         except ServerNotFound:
             raise HTTPException(404, "no such server") from None
         except CreateInProgress:
@@ -183,7 +186,6 @@ def create_app(
             raise HTTPException(
                 409, f"{exc.count} player(s) online; pass ?force=true to disconnect them"
             ) from None
-        return {"name": name, "deleted": True, "backup": backup}
 
     @app.get("/api/v1/me")
     def me(tenant: Tenant) -> dict:
