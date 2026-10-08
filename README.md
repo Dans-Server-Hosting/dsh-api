@@ -218,6 +218,7 @@ src/dsh_api/
   feedback.py  submit / list / triage user feedback
   db.py        SQLite schema and queries
   mojang.py    operator UUID lookup (real + fake)
+  plugins.py   default-plugin URLs described for GET /api/v1/default-plugins
   config.py    settings and the limits profile
 tests/         pytest, no cluster required
 deploy/        Kubernetes manifests
