@@ -79,6 +79,11 @@ class Settings:
     max_servers_per_tenant: int = 1
     admin_users: frozenset[str] = frozenset(split_csv(DEFAULT_ADMIN_USERS))
     default_plugins: tuple[str, ...] = split_csv(DEFAULT_PLUGINS)
+    plugin_selection: bool = False
+    """Tenants choose their plugins (RFC 0020). Needs every server on an OMCSI
+    image that reconciles the <name>-plugins ConfigMap at boot; until then the
+    routes answer 503 and new servers get DEFAULT_PLUGINS as before."""
+    dpc_api: str = "https://api.dansplugins.com"
     limits: Limits = field(default_factory=Limits)
 
     @classmethod
@@ -101,6 +106,8 @@ class Settings:
             ),
             admin_users=frozenset(split_csv(env.get("DSH_ADMIN_USERS", DEFAULT_ADMIN_USERS))),
             default_plugins=split_csv(env.get("DSH_DEFAULT_PLUGINS", DEFAULT_PLUGINS)),
+            plugin_selection=env.get("DSH_PLUGIN_SELECTION", "").lower() in ("1", "true", "yes"),
+            dpc_api=env.get("DSH_DPC_API", cls.dpc_api),
             limits=Limits.from_env(env),
         )
 

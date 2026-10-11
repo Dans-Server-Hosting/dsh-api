@@ -22,6 +22,7 @@ from dsh_api.cluster import (
     WrapperStatus,
     helm_install_argv,
     http_json,
+    plugin_selection_configmap,
     server_list_ping,
     tenant_namespace_manifests,
     tenant_rolebinding_manifest,
@@ -338,10 +339,12 @@ class Http:
 
     def __init__(self, *answers):
         self.calls = []
+        self.bodies = []
         self.answers = list(answers)
 
-    def __call__(self, url, method="GET", timeout=3.0):
+    def __call__(self, url, method="GET", timeout=3.0, body=None):
         self.calls.append((url, method, timeout))
+        self.bodies.append(body)
         return self.answers.pop(0) if self.answers else None
 
 
@@ -748,3 +751,79 @@ def test_generated_credentials_are_distinct_and_shell_safe():
     assert a != b
     for value in (a.rcon_password, a.admin_password, a.deploy_auth_token, a.deployment_auth_token):
         assert value.isalnum() and len(value) >= 16
+
+
+# --- plugin selection (RFC 0020) ----------------------------------------------
+
+
+def test_plugin_selection_is_applied_as_the_configmap_omcsi_mounts(backend):
+    be, runner = backend
+    be.write_plugin_selection("alpha", '{"version": 1, "plugins": []}\n')
+    argv, stdin, _ = runner.calls[0]
+    assert argv == ["kubectl", "apply", "-f", "-"]
+    manifest = json.loads(stdin)
+    # OMCSI's chart mounts <release>-plugins; the release is named after the server.
+    assert manifest == plugin_selection_configmap("alpha", '{"version": 1, "plugins": []}\n')
+    assert manifest["metadata"] == {"name": "alpha-plugins", "namespace": "t-alpha"}
+    assert manifest["data"] == {"selection.json": '{"version": 1, "plugins": []}\n'}
+
+
+def test_restart_deletes_the_wrapper_pod_without_waiting(backend):
+    be, runner = backend
+    be.restart_wrapper_pod("alpha")
+    assert runner.calls[0][0] == [
+        "kubectl", "-n", "t-alpha", "delete", "pod",
+        "alpha-omcsi-minecraft-wrapper-0", "--wait=false",
+    ]  # fmt: skip
+
+
+def test_plugins_applied_reads_the_wrapper_report(tmp_path):
+    report = {"selection_sha256": "abc", "plugins": {"fiefs": "installed"}}
+    http = Http((200, report))
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path), http=http)
+    assert be.plugins_applied("alpha") == report
+    assert http.calls == [(wrapper_api_url("alpha", "/api/plugins/applied"), "GET", 3.0)]
+
+
+@pytest.mark.parametrize("answer", [None, (404, None), (200, ["not", "a", "report"])])
+def test_plugins_applied_is_none_without_a_report(tmp_path, answer):
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path), http=Http(answer))
+    assert be.plugins_applied("alpha") is None
+
+
+def test_send_command_posts_the_command_as_text(tmp_path):
+    http = Http((200, None))
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path), http=http)
+    assert be.send_command("alpha", "say hello") is True
+    assert http.calls == [(wrapper_api_url("alpha", "/api/server/command"), "POST", 3.0)]
+    assert http.bodies == ["say hello"]
+    assert (
+        KubectlHelmBackend("/opt/omcsi", str(tmp_path), http=Http(None)).send_command(
+            "alpha", "say hello"
+        )
+        is False
+    )
+
+
+def test_http_json_sends_a_text_body():
+    received = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers["Content-Length"])
+            received.append((self.headers["Content-Type"], self.rfile.read(length).decode()))
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *_):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{srv.server_port}/api/server/command"
+        assert http_json(url, method="POST", body="say hi") == (200, None)
+        assert received == [("text/plain", "say hi")]
+    finally:
+        srv.shutdown()

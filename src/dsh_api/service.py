@@ -21,6 +21,7 @@ from dsh_api.cluster import (
 from dsh_api.config import Settings
 from dsh_api.db import Database, ServerRow
 from dsh_api.mojang import UuidResolver
+from dsh_api.selection import default_selection, selection_json, selection_sha256
 
 log = logging.getLogger(__name__)
 
@@ -177,7 +178,8 @@ class ServerService:
             players_online=players,
         )
 
-    def _owned(self, tenant_id: str, name: str) -> ServerRow:
+    def owned(self, tenant_id: str, name: str) -> ServerRow:
+        """The tenant's server row; ``ServerNotFound`` for anyone else's."""
         row = self.db.get_server(name)
         if row is None or row.tenant_id != tenant_id:
             raise ServerNotFound(name)
@@ -187,7 +189,7 @@ class ServerService:
         return [self._view(row, with_players=False) for row in self.db.list_servers(tenant_id)]
 
     def get(self, tenant_id: str, name: str) -> ServerView:
-        return self._view(self._owned(tenant_id, name), with_players=True)
+        return self._view(self.owned(tenant_id, name), with_players=True)
 
     # --- writes --------------------------------------------------------------
 
@@ -217,7 +219,10 @@ class ServerService:
             motd=motd,
             operator_name=operator_username,
             operator_uuid=operator_uuid,
-            default_plugins=self.settings.default_plugins,
+            # With plugin selection on, the defaults are the server's first
+            # selection instead: DEFAULT_PLUGINS only ever adds, so a default
+            # the tenant removed would come back at every boot.
+            default_plugins=() if self.settings.plugin_selection else self.settings.default_plugins,
         )
         creds = Credentials.generate()
         row = self.db.insert_server(
@@ -237,6 +242,8 @@ class ServerService:
             # Before anything namespaced: the API's own permissions in t-<name>.
             self.cluster.grant_tenant_access(name)
             self.cluster.create_credentials(name, creds)
+            if self.settings.plugin_selection:
+                self._seed_plugin_selection(name)
             # The profile installs the wrapper asleep and the webapp waits for
             # it, so the release is installed without waiting, the wrapper is
             # woken once, and only then are the rollouts waited for.
@@ -254,6 +261,15 @@ class ServerService:
         self.db.set_status(name, "ready")
         self.db.record(tenant_id, name, "create.done")
 
+    def _seed_plugin_selection(self, name: str) -> None:
+        """The default plugins as the new server's selection, in its ConfigMap
+        before the first boot so that boot installs them."""
+        rows = default_selection(self.settings.default_plugins)
+        text = selection_json(rows)
+        self.cluster.write_plugin_selection(name, text)
+        self.db.seed_plugins(name, rows)
+        self.db.set_plugin_hashes(name, written=selection_sha256(text))
+
     def _provision_failed(self, tenant_id: str, name: str, detail: str) -> None:
         # The namespace and release are left as they are for inspection; the
         # tenant's slot is held until they DELETE the failed server.
@@ -267,7 +283,7 @@ class ServerService:
         crash-looping pod does nothing useful, and a StatefulSet that is gone
         cannot be scaled at all; the failure is reported instead).
         """
-        row = self._owned(tenant_id, name)
+        row = self.owned(tenant_id, name)
         if row.status != "ready":
             # Still being created, or the create failed: nothing to scale yet.
             return self._view(row, with_players=False)
@@ -296,7 +312,7 @@ class ServerService:
         it), and one with players online unless ``force``. A second DELETE
         while one is running answers with the server as it is.
         """
-        row = self._owned(tenant_id, name)
+        row = self.owned(tenant_id, name)
         if row.status == "provisioning":
             raise CreateInProgress(name)
         if row.status == "deleting":
