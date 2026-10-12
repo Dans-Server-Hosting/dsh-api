@@ -49,12 +49,18 @@ class DefaultPlugin:
     project_url: str | None
 
 
-def describe_plugin(url: str) -> DefaultPlugin:
-    parsed = urlparse(url)
-    filename = parsed.path.rsplit("/", 1)[-1]
+def jar_name_and_version(url: str) -> tuple[str, str]:
+    """The name and version parts of a jar URL's filename:
+    ``.../ViaVersion-5.12.0.jar`` is ``("ViaVersion", "5.12.0")``."""
+    filename = urlparse(url).path.rsplit("/", 1)[-1]
     stem = filename[:-4] if filename.endswith(".jar") else filename
     match = _NAME_VERSION.match(stem)
-    key, version = (match["name"], match["version"]) if match else (stem, "")
+    return (match["name"], match["version"]) if match else (stem, "")
+
+
+def describe_plugin(url: str) -> DefaultPlugin:
+    parsed = urlparse(url)
+    key, version = jar_name_and_version(url)
     name, description = KNOWN_PLUGINS.get(key, (key, ""))
     project_url = None
     if parsed.netloc == "github.com":

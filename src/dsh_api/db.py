@@ -5,6 +5,7 @@ The cluster remains the source of truth for whether a server exists.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -43,6 +44,23 @@ CREATE TABLE IF NOT EXISTS feedback (
     created_at TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'new'
 );
+CREATE TABLE IF NOT EXISTS server_plugins (
+    server TEXT NOT NULL,
+    slug TEXT NOT NULL,
+    tag TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    url TEXT NOT NULL,
+    requires TEXT NOT NULL DEFAULT '[]',
+    added_by TEXT NOT NULL,
+    added_at TEXT NOT NULL,
+    PRIMARY KEY (server, slug)
+);
+CREATE TABLE IF NOT EXISTS server_plugin_state (
+    server TEXT PRIMARY KEY,
+    seeded_at TEXT NOT NULL,
+    written_sha256 TEXT,
+    applied_sha256 TEXT
+);
 """
 
 MIGRATIONS = {
@@ -74,6 +92,32 @@ class ServerRow:
     created_at: str
     last_woken_at: str | None
     status: str = "ready"
+
+
+@dataclass(frozen=True)
+class SelectedPlugin:
+    """One plugin in a server's selection, pinned to the release chosen when it
+    was added (a boot never changes its version)."""
+
+    slug: str
+    tag: str
+    filename: str
+    url: str
+    requires: tuple[str, ...] = ()
+    added_by: str = "tenant"
+    """``tenant`` (chosen), ``dependency`` (pulled in by a ``requires``), or
+    ``default`` (what every server starts with)."""
+    added_at: str = ""
+
+
+@dataclass(frozen=True)
+class PluginState:
+    server: str
+    seeded_at: str
+    written_sha256: str | None
+    """Hash of the selection last written to the server's ConfigMap."""
+    applied_sha256: str | None
+    """Hash of the selection the server last reported applying at boot."""
 
 
 @dataclass(frozen=True)
@@ -192,8 +236,88 @@ class Database:
             conn.execute("UPDATE servers SET last_woken_at = ? WHERE name = ?", (now_iso(), name))
 
     def delete_server(self, name: str) -> None:
+        # Names are reused once a server is gone, so its plugin selection goes with it.
         with self._connect() as conn:
             conn.execute("DELETE FROM servers WHERE name = ?", (name,))
+            conn.execute("DELETE FROM server_plugins WHERE server = ?", (name,))
+            conn.execute("DELETE FROM server_plugin_state WHERE server = ?", (name,))
+
+    # --- plugin selection ----------------------------------------------------
+
+    def plugin_state(self, server: str) -> PluginState | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM server_plugin_state WHERE server = ?", (server,)
+            ).fetchone()
+        return PluginState(**row) if row else None
+
+    def seed_plugins(self, server: str, rows: list[SelectedPlugin]) -> bool:
+        """Give a server its first selection; False (and no change) when it has
+        had one before, even if the tenant has since removed everything."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO server_plugin_state (server, seeded_at) VALUES (?, ?)",
+                (server, now_iso()),
+            )
+            if cur.rowcount != 1:
+                return False
+            for row in rows:
+                self._insert_plugin(conn, server, row)
+        return True
+
+    def selected_plugins(self, server: str) -> list[SelectedPlugin]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT slug, tag, filename, url, requires, added_by, added_at"
+                " FROM server_plugins WHERE server = ? ORDER BY added_at, slug",
+                (server,),
+            ).fetchall()
+        return [
+            SelectedPlugin(**{**dict(r), "requires": tuple(json.loads(r["requires"]))})
+            for r in rows
+        ]
+
+    def add_plugins(self, server: str, rows: list[SelectedPlugin]) -> None:
+        with self._connect() as conn:
+            for row in rows:
+                self._insert_plugin(conn, server, row)
+
+    def remove_plugin(self, server: str, slug: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM server_plugins WHERE server = ? AND slug = ?", (server, slug))
+
+    def set_plugin_hashes(
+        self, server: str, *, written: str | None = None, applied: str | None = None
+    ) -> None:
+        with self._connect() as conn:
+            if written is not None:
+                conn.execute(
+                    "UPDATE server_plugin_state SET written_sha256 = ? WHERE server = ?",
+                    (written, server),
+                )
+            if applied is not None:
+                conn.execute(
+                    "UPDATE server_plugin_state SET applied_sha256 = ? WHERE server = ?",
+                    (applied, server),
+                )
+
+    @staticmethod
+    def _insert_plugin(conn: sqlite3.Connection, server: str, row: SelectedPlugin) -> None:
+        conn.execute(
+            "INSERT OR IGNORE INTO server_plugins"
+            " (server, slug, tag, filename, url, requires, added_by, added_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                server,
+                row.slug,
+                row.tag,
+                row.filename,
+                row.url,
+                json.dumps(list(row.requires)),
+                row.added_by,
+                row.added_at or now_iso(),
+            ),
+        )
 
     # --- events ------------------------------------------------------------
 

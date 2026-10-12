@@ -7,6 +7,7 @@ state in memory so every handler can be tested without a cluster.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 import socket
@@ -157,6 +158,22 @@ class ClusterBackend(Protocol):
     def backup_world(self, name: str, awake: bool) -> Path:
         """Write a tarball of /mcserver to the backup directory; return its path."""
 
+    def write_plugin_selection(self, name: str, selection_json: str) -> None:
+        """ConfigMap ``<name>-plugins`` (key ``selection.json``) in the tenant
+        namespace; the wrapper reconciles plugins/ against it at every start."""
+
+    def plugins_applied(self, name: str) -> dict | None:
+        """What the wrapper reports about the selection it reconciled at its
+        last start, or None when it cannot be asked or has reconciled none."""
+
+    def send_command(self, name: str, command: str) -> bool:
+        """Send a console command through the wrapper; False when it could not
+        be delivered. Best effort: callers use it for warnings only."""
+
+    def restart_wrapper_pod(self, name: str) -> None:
+        """Delete the wrapper pod so the StatefulSet recreates it. A pod start,
+        not the wrapper's own restart, is what re-runs the boot script."""
+
     def uninstall_release(self, name: str) -> None: ...
 
     def delete_namespace(self, name: str) -> None: ...
@@ -295,6 +312,16 @@ def tenant_rolebinding_manifest(name: str, sa_namespace: str, sa_name: str) -> d
     }
 
 
+def plugin_selection_configmap(name: str, selection_json: str) -> dict:
+    """The ConfigMap OMCSI mounts at /etc/omcsi/plugins (``<release>-plugins``)."""
+    return {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": f"{name}-plugins", "namespace": namespace_for(name)},
+        "data": {"selection.json": selection_json},
+    }
+
+
 def helm_install_argv(
     spec: ReleaseSpec, creds: Credentials, omcsi_dir: str, keep_awake: bool = False
 ) -> list[str]:
@@ -402,11 +429,17 @@ def wrapper_api_url(name: str, path: str) -> str:
 
 
 def http_json(
-    url: str, method: str = "GET", timeout: float = WRAPPER_HTTP_TIMEOUT
+    url: str,
+    method: str = "GET",
+    timeout: float = WRAPPER_HTTP_TIMEOUT,
+    body: str | None = None,
 ) -> tuple[int, object] | None:
     """One HTTP round trip; ``(status, parsed body)``, or None when the host
-    could not be reached at all (refused, unresolvable, timed out)."""
-    request = urllib.request.Request(url, method=method)
+    could not be reached at all (refused, unresolvable, timed out). A ``body``
+    is sent as plain text."""
+    data = body.encode() if body is not None else None
+    headers = {"Content-Type": "text/plain"} if body is not None else {}
+    request = urllib.request.Request(url, method=method, data=data, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as resp:
             status = resp.status
@@ -650,6 +683,30 @@ class KubectlHelmBackend:
             raise ClusterError("backup is empty; refusing to continue")
         return path
 
+    def write_plugin_selection(self, name: str, selection_json: str) -> None:
+        manifest = plugin_selection_configmap(name, selection_json)
+        self._run(["kubectl", "apply", "-f", "-"], stdin=json.dumps(manifest))
+
+    def plugins_applied(self, name: str) -> dict | None:
+        answer = self._http(wrapper_api_url(name, "/api/plugins/applied"))
+        if answer is None or answer[0] != 200 or not isinstance(answer[1], dict):
+            return None
+        return answer[1]
+
+    def send_command(self, name: str, command: str) -> bool:
+        answer = self._http(
+            wrapper_api_url(name, "/api/server/command"), method="POST", body=command
+        )
+        return answer is not None and answer[0] == 200
+
+    def restart_wrapper_pod(self, name: str) -> None:
+        # The chart's terminationGracePeriodSeconds gives the wrapper's
+        # shutdown hook time to save the world and stop the game.
+        self._run([
+            "kubectl", "-n", namespace_for(name), "delete", "pod",
+            f"{name}{WRAPPER_STS_SUFFIX}-0", "--wait=false",
+        ])  # fmt: skip
+
     def uninstall_release(self, name: str) -> None:
         """Idempotent: a release that is already gone (an earlier attempt, or
         the operator's script, got that far) is not an error on the way out."""
@@ -699,6 +756,11 @@ class FakeClusterBackend:
     wrapper_statuses: dict[str, WrapperStatus | None] = field(default_factory=dict)
     """Per server, what its wrapper answers; absent or None means unreachable."""
     players: dict[str, int | None] = field(default_factory=dict)
+    selections: dict[str, str] = field(default_factory=dict)
+    """Per server, the selection.json in its ConfigMap."""
+    applied: dict[str, dict] = field(default_factory=dict)
+    """Per server, what its wrapper reports at /api/plugins/applied."""
+    commands: list[tuple[str, str]] = field(default_factory=list)
     ops: list[tuple] = field(default_factory=list)
     fail_on: set[str] = field(default_factory=set)
 
@@ -786,6 +848,45 @@ class FakeClusterBackend:
         path = self.backup_dir / f"{name}-{stamp}.tar.gz"
         path.write_bytes(b"fake world of " + name.encode())
         return path
+
+    def write_plugin_selection(self, name: str, selection_json: str) -> None:
+        self._op("write_plugin_selection", name)
+        self._require_binding(name)
+        self.selections[name] = selection_json
+
+    def plugins_applied(self, name: str) -> dict | None:
+        current = self.wrappers.get(name)
+        if current is None or current.ready_replicas < 1:
+            return None
+        return self.applied.get(name)
+
+    def send_command(self, name: str, command: str) -> bool:
+        self.commands.append((name, command))
+        status = self.wrapper_statuses.get(name)
+        return status is not None and status.running
+
+    def restart_wrapper_pod(self, name: str) -> None:
+        self._op("restart_wrapper_pod", name)
+        current = self.wrappers.get(name)
+        if current is None or current.replicas < 1:
+            raise ClusterError(f"pods {name}{WRAPPER_STS_SUFFIX}-0 not found")
+        self.wrappers[name] = replace(current, ready_replicas=0, scaled_at=datetime.now(UTC))
+        self.wrapper_statuses.pop(name, None)
+
+    def boot(self, name: str) -> None:
+        """Test helper: the pod came up and its boot script reconciled the
+        selection in its ConfigMap, the way OMCSI's post-create.sh does."""
+        self.become_ready(name)
+        self.wrapper_statuses[name] = WrapperStatus(running=True, pid=1, uptime_seconds=0)
+        selection = self.selections.get(name)
+        if selection is None:
+            self.applied.pop(name, None)
+            return
+        plugins = json.loads(selection)["plugins"]
+        self.applied[name] = {
+            "selection_sha256": hashlib.sha256(selection.encode()).hexdigest(),
+            "plugins": {p["slug"]: "installed" for p in plugins},
+        }
 
     def uninstall_release(self, name: str) -> None:
         self._op("uninstall_release", name)

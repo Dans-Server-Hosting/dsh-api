@@ -79,6 +79,11 @@ never fails a list or get.
 | `GET` | `/api/v1/servers/{name}` | one server, with `players_online` when `awake` (`null` otherwise) |
 | `POST` | `/api/v1/servers/{name}/wake` | 202 with the resulting server: `asleep` → scales the wrapper to 1; `stopped` → `POST /api/server/start` on the wrapper; `waking`/`awake`/`failed` → no-op (a failed server, including one whose StatefulSet is gone, is reported as such rather than scaled) |
 | `DELETE` | `/api/v1/servers/{name}` | **202** with the server in state `deleting`; backup, `helm uninstall` and namespace delete then run in the background, and `GET` answers 404 once they are done. 409 while players are online unless `?force=true`; 409 while the server is still `provisioning`; a `failed` create is removed even when there is nothing to back up; a retry after a delete that failed past its backup reuses that backup when the world volume is already gone |
+| `GET` | `/api/v1/catalog` | the plugins a tenant can install, by title (`slug`, `title`, `description`, `tags`, `requires`, `version`, `icon_url`, `project_url`): the Dan's Plugins catalog plus the non-DPC defaults; no token needed. 503 while plugin selection is off, or when dansplugins.com cannot be read and nothing is cached |
+| `GET` | `/api/v1/servers/{name}/plugins` | the server's plugin selection: `{server, state, players_online, pending, plugins: [{slug, title, version, added_by, requires, required_by, status}]}`. `status` is `installed`, `pending` (waits for the next start) or `failed: <reason>` from the last boot; `pending` is true while a change waits |
+| `PUT` | `/api/v1/servers/{name}/plugins/{slug}` | select a plugin and anything it `requires` (`added_by: dependency`), pinned to the catalog's current release; idempotent. `{added: [slugs], ...the selection}`. 404 for a slug not in the catalog; 409 while the server is being created or deleted |
+| `DELETE` | `/api/v1/servers/{name}/plugins/{slug}` | deselect a plugin; its data folder is kept. `{removed, unused_dependencies: [slugs], ...the selection}`; offer `unused_dependencies` for removal, they are not removed. 409 `{required_by}` while another selected plugin requires it; 404 when it is not selected |
+| `POST` | `/api/v1/servers/{name}/plugins/apply` | `{confirm_players?}` → 202. `asleep`: `{applies: "next_start"}`, nothing restarted. `awake`/`stopped`: deletes the wrapper pod so its boot script applies the selection, `{applies: "restarting"}`; with players online, 409 `{players_online}` unless `confirm_players`, then an in-game warning first. 409 while `waking` |
 | `GET` | `/api/v1/me` | `{username, is_admin}` for the caller; admins are the `DSH_ADMIN_USERS` logins |
 | `POST` | `/api/v1/feedback` | `{message (1–4000 chars), page?}` → 201; any signed-in user, at most 10 per user per hour (429) |
 | `GET` | `/api/v1/feedback?status=new\|read\|all` | admin only (403 otherwise); newest first, default `new` |
@@ -153,6 +158,8 @@ OMCSI checkout at `OMCSI_CHART_DIR` (the image provides all three).
 | `DSH_MAX_SERVERS_PER_TENANT` | `1` | the cap behind the 403 |
 | `DSH_ADMIN_USERS` | `dmccoystephenson` | comma-separated JWT `sub`s that may read and triage feedback |
 | `DSH_DEFAULT_PLUGINS` | Dan's Plugin Manager `0.7.0-SNAPSHOT-8-8-2026`, ViaVersion `5.12.0`, ViaBackwards `5.12.0` release jars | comma-separated plugin download URLs every new server is installed with; empty for none. Also what `GET /api/v1/default-plugins` describes |
+| `DSH_PLUGIN_SELECTION` | `false` | `true` lets tenants choose their plugins (see Plugin selection); only once the cluster's OMCSI includes the plugin reconcile step |
+| `DSH_DPC_API` | `https://api.dansplugins.com` | where the plugin catalog is read from |
 | `DSH_LIMIT_HEAP_GB` | `3` | free-tier profile served by `GET /api/v1/limits` |
 | `DSH_LIMIT_MEMORY_LIMIT_GIB` | `3.5` | " |
 | `DSH_LIMIT_WORLD_QUOTA_GIB` | `5` | " |
@@ -207,6 +214,26 @@ Deployment fills from the pod's own namespace and `serviceAccountName`, so
 renaming either in the manifests cannot leave the binding pointing at the
 wrong subject.
 
+### Plugin selection (RFC 0020)
+
+Off until `DSH_PLUGIN_SELECTION=true`: it needs every server on an OMCSI image
+whose boot script reconciles the `<name>-plugins` ConfigMap (OMCSI #308), so
+it is switched on only after the cluster's OMCSI pin includes it. While it is
+on:
+
+- A new server's defaults are written to its ConfigMap as its first selection,
+  and the release gets **no** `DEFAULT_PLUGINS`: that path only ever adds, so a
+  default the tenant removed would come back at every boot.
+- A server created before has no ConfigMap. Its selection starts as the
+  default plugins (what is on its disk) the first time it is read, and nothing
+  is written to the cluster until the tenant changes it. Its release still
+  carries `DEFAULT_PLUGINS`, so a default plugin removed from it returns at the
+  next boot until the release is upgraded without it.
+- Changing a selection rewrites the ConfigMap and nothing else. It takes
+  effect at the next pod start: the next wake of an asleep server, or `apply`.
+- Each plugin is pinned to the release that was current when it was added;
+  the boot script downloads through DPC's counting URL.
+
 ## Layout
 
 ```
@@ -215,6 +242,9 @@ src/dsh_api/
   auth.py      JWT validation (real + fake)
   cluster.py   ClusterBackend: kubectl/helm backend + in-memory fake
   service.py   create / list / get / wake / delete
+  plugin_service.py  a server's plugin selection: add / remove / apply
+  catalog.py   the installable plugins: dansplugins.com, cached (real + fake)
+  selection.py the selection.json the wrapper reconciles, and its hash
   feedback.py  submit / list / triage user feedback
   db.py        SQLite schema and queries
   mojang.py    operator UUID lookup (real + fake)

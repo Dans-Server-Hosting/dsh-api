@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from dsh_api.auth import FakeValidator
+from dsh_api.catalog import FakeCatalog
 from dsh_api.cluster import FakeClusterBackend
 from dsh_api.config import Settings
 from dsh_api.db import Database
@@ -72,7 +73,13 @@ def resolver() -> FakeResolver:
 
 
 @pytest.fixture
-def client(settings, db, cluster, resolver, jobs) -> TestClient:
+def catalog() -> FakeCatalog:
+    """No test reaches dansplugins.com; plugin tests fill this in."""
+    return FakeCatalog()
+
+
+@pytest.fixture
+def client(settings, db, cluster, resolver, jobs, catalog) -> TestClient:
     app = create_app(
         settings,
         db=db,
@@ -82,6 +89,7 @@ def client(settings, db, cluster, resolver, jobs) -> TestClient:
         ),
         uuids=resolver,
         jobs=jobs,
+        catalog=catalog,
     )
     return TestClient(app)
 
