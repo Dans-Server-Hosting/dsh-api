@@ -1,4 +1,10 @@
+from dataclasses import replace
+
+import pytest
+
+from dsh_api.auth import FakeValidator
 from dsh_api.config import DEFAULT_PLUGINS, Limits, Settings, split_csv
+from dsh_api.main import create_app
 
 
 def test_healthz(client):
@@ -56,6 +62,19 @@ def test_settings_from_env():
         "dsh-api",
         "dsh-api",
     )  # what deploy/rbac.yaml creates
+
+
+def test_the_app_will_not_start_without_a_node_ip(settings, db, cluster, resolver, jobs):
+    """An empty DSH_NODE_IP would hand out <name>..sslip.io hostnames."""
+    with pytest.raises(ValueError, match="DSH_NODE_IP is required"):
+        create_app(
+            replace(settings, node_ip=""),
+            db=db,
+            cluster=cluster,
+            validator=FakeValidator({}),
+            uuids=resolver,
+            jobs=jobs,
+        )
 
 
 def test_settings_defaults_for_admins_and_plugins():

@@ -80,6 +80,9 @@ def create_app(
     catalog: PluginCatalog | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
+    if not settings.node_ip:
+        # Every server's fallback hostname is <name>.<ip-dashed>.sslip.io.
+        raise ValueError("DSH_NODE_IP is required")
     db = db or Database(settings.db_path)
     cluster = cluster or KubectlHelmBackend(
         settings.omcsi_dir,
