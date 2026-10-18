@@ -7,7 +7,7 @@
 - Python 3.11, FastAPI, stdlib-heavy. Chosen because everything it drives today is `kubectl`/`helm`/bash and the fleet control plane it will defer to later is Python; a JVM service would wrap shell commands from the wrong side of the fence.
 - Runs **in the cluster**, in its own namespace, with a ServiceAccount whose Role can create namespaces, ResourceQuotas and Helm releases — and nothing else. It never holds a kubeconfig file. *Since the MVP: the grant is split into a small cluster-wide role and a tenant role bound only inside each `t-<name>` namespace; see Permission model in the README.*
 - Authenticates callers with UserAuth JWTs (`Authorization: Bearer`), validated with the shared HS256 secret (or `GET /session/validate` against the UserAuth service). The JWT `sub` is the tenant id. No local user table beyond a `tenants` row created on first call.
-- State: one SQLite file on a small PVC (tenants, servers, events). The cluster is the source of truth for whether a server exists; the database records who owns what and what was asked for.
+- State: one SQLite file on a small PVC (tenants, servers, events). The cluster is the source of truth for whether a server exists; the database records who owns what and what was asked for. *Since the MVP: it also holds feedback and each server's plugin selection; see How it works in the README.*
 
 ## Endpoints (v1)
 
