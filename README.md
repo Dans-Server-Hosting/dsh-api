@@ -237,6 +237,27 @@ on:
 - Each plugin is pinned to the release that was current when it was added;
   the boot script downloads through DPC's counting URL.
 
+## World export image (RFC 0021)
+
+`export/` builds the image the world-export pod runs: Minecraft-USD-Exporter
+and usd-web, each pinned to a commit (`EXPORTER_PIN`, `USD_WEB_PIN`), plus
+`export/dsh_world_export.py` installed as `dsh-world-export`. Given the
+server directory mounted read-only at `/mcserver` and a scratch `emptyDir` at
+`/work`, it copies `level.dat` and only the overworld region files the box
+needs (never `playerdata/`, `stats/`, `advancements/`, `entities/` or
+`poi/`), checks the copy did not race a write, runs `mc-usd-export` on the
+copy and `usd-web tiles` on its terrain, and writes a gzipped tar of
+`world.zip` (the two USD layers and a README), `summary.json` (a fixed set of
+fields, no paths) and `preview/` (usd-web `index.json` + `.uwt` tiles) to
+stdout, with `phase=<name>` progress lines on stderr. The default box is
+256 × 256 blocks around spawn at every height. It sends nothing to the game
+and has no network.
+
+```sh
+docker build -t dsh-world-export:local export/
+export/smoke.sh dsh-world-export:local   # the committed fixture, as the pod runs it
+```
+
 ## Layout
 
 ```
@@ -254,5 +275,6 @@ src/dsh_api/
   plugins.py   default-plugin URLs described for GET /api/v1/default-plugins
   config.py    settings and the limits profile
 tests/         pytest, no cluster required
+export/        the world-export image (RFC 0021) and its smoke test
 deploy/        Kubernetes manifests
 ```
