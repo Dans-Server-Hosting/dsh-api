@@ -16,6 +16,11 @@ data:
   # Tenants choose their plugins (RFC 0020). Leave "false" until the cluster's
   # OMCSI pin includes the boot-time plugin reconcile step (OMCSI #308).
   DSH_PLUGIN_SELECTION: "false"
+  # Owners can export their world as 3D (RFC 0021). Leave "false" until the
+  # export image (export/Dockerfile) is on the node under DSH_EXPORT_IMAGE.
+  DSH_WORLD_EXPORT: "false"
+  DSH_EXPORT_IMAGE: "dsh-world-export:local"
+  DSH_EXPORT_DIR: /exports
   DSH_DB_PATH: /data/dsh-api.db
   DSH_BACKUP_DIR: /backups
   OMCSI_CHART_DIR: /opt/omcsi

@@ -75,7 +75,7 @@ never fails a list or get.
 | Method | Path | Notes |
 |---|---|---|
 | `GET` | `/healthz` | liveness |
-| `GET` | `/api/v1/limits` | free-tier profile as numbers; no token needed |
+| `GET` | `/api/v1/limits` | free-tier profile as numbers, plus the world-export limits (`export_default_size`, `export_max_size`, `export_daily_limit`, `export_retention_hours`); no token needed |
 | `GET` | `/api/v1/default-plugins` | the plugins every new server is installed with, in install order (`name`, `version`, `description`, `download_url`, `project_url`); no token needed |
 | `GET` | `/api/v1/servers` | the caller's servers |
 | `POST` | `/api/v1/servers` | `{name, motd?, operator_username?}` → **202** with the server in state `provisioning`; the admin password is in this response **only**. 409 `{"detail": "a server is already being created for this account", "server": "<name>"}` while the caller's earlier create is still running; 409 when the name is taken; 403 at the tenant cap |
@@ -87,6 +87,13 @@ never fails a list or get.
 | `PUT` | `/api/v1/servers/{name}/plugins/{slug}` | select a plugin and anything it `requires` (`added_by: dependency`), pinned to the catalog's current release; idempotent. `{added: [slugs], ...the selection}`. 404 for a slug not in the catalog; 409 while the server is being created or deleted |
 | `DELETE` | `/api/v1/servers/{name}/plugins/{slug}` | deselect a plugin; its data folder is kept. `{removed, unused_dependencies: [slugs], ...the selection}`; offer `unused_dependencies` for removal, they are not removed. 409 `{required_by}` while another selected plugin requires it; 404 when it is not selected |
 | `POST` | `/api/v1/servers/{name}/plugins/apply` | `{confirm_players?}` → 202. `asleep`: `{applies: "next_start"}`, nothing restarted. `awake`/`stopped`: deletes the wrapper pod so its boot script applies the selection, `{applies: "restarting"}`; with players online, 409 `{players_online}` unless `confirm_players`, then an in-game warning first. 409 while `waking` |
+| `GET` | `/api/v1/servers/{name}/exports` | world export (see [World export](#world-export-rfc-0021)); `{exports: [...]}` newest first. Every export route answers 503 while `DSH_WORLD_EXPORT` is off |
+| `POST` | `/api/v1/servers/{name}/exports` | `{area?: {x1, z1, x2, z2}}` → **202** with the export `queued`; no `area` means 256 × 256 around spawn. Every height. 409 while another export of the server is queued/running or the server is provisioning/deleting/failing; 422 for an area over `DSH_EXPORT_MAX_SIZE` a side; 429 `{retry_after}` at the daily limit |
+| `GET` | `/api/v1/servers/{name}/exports/{id}` | one export: `{id, server, status: queued\|running\|ready\|failed, phase, area, custom_area, snapshot: at_rest\|live_stable\|live_changing, created_at, finished_at, expires_at, error, stats: {blocks_scanned, instances, zip_bytes, preview_bytes}}` |
+| `GET` | `/api/v1/servers/{name}/exports/{id}/preview/{file}` | a usd-web preview file (`index.json`, or a `.uwt` tile as gzip bytes); 404 until `ready` |
+| `POST` | `/api/v1/servers/{name}/exports/{id}/link` | `{url, expires_at}`: a signed link to the zip, valid for 15 minutes; 409 until `ready` |
+| `GET` | `/api/v1/export-downloads/{token}` | **no token needed**: the signed link is the credential; the zip as `<server>-world-<id>.zip`. 404 for a bad, expired or deleted link |
+| `DELETE` | `/api/v1/servers/{name}/exports/{id}` | 204; 409 while it is queued/running |
 | `GET` | `/api/v1/me` | `{username, is_admin}` for the caller; admins are the `DSH_ADMIN_USERS` logins |
 | `POST` | `/api/v1/feedback` | `{message (1–4000 chars), page?}` → 201; any signed-in user, at most 10 per user per hour (429) |
 | `GET` | `/api/v1/feedback?status=new\|read\|all` | admin only (403 otherwise); newest first, default `new` |
@@ -163,6 +170,16 @@ OMCSI checkout at `OMCSI_CHART_DIR` (the image provides all three).
 | `DSH_DEFAULT_PLUGINS` | Dan's Plugin Manager `0.7.0-SNAPSHOT-8-8-2026`, ViaVersion `5.12.0`, ViaBackwards `5.12.0` release jars | comma-separated plugin download URLs every new server is installed with; empty for none. Also what `GET /api/v1/default-plugins` describes |
 | `DSH_PLUGIN_SELECTION` | `false` | `true` lets tenants choose their plugins (see Plugin selection); only once the cluster's OMCSI includes the plugin reconcile step |
 | `DSH_DPC_API` | `https://api.dansplugins.com` | where the plugin catalog is read from |
+| `DSH_WORLD_EXPORT` | `false` | `true` lets owners export their world as 3D (see World export); only once the export image is on the node |
+| `DSH_EXPORT_IMAGE` | `dsh-world-export:local` | the image built from `export/` |
+| `DSH_EXPORT_DIR` | `/exports` | where finished exports are kept (`<server>/<id>/`) |
+| `DSH_EXPORT_DEFAULT_SIZE` | `256` | blocks a side of the default box around spawn |
+| `DSH_EXPORT_MAX_SIZE` | `512` | the largest box a side |
+| `DSH_EXPORT_DAILY_LIMIT` | `5` | exports per account per rolling 24 hours |
+| `DSH_EXPORT_RETENTION_HOURS` | `72` | how long a finished export is kept |
+| `DSH_EXPORT_TIMEOUT_SECONDS` | `600` | the API stops a run after this; the pod's own deadline is 900 s |
+| `DSH_EXPORT_LINK_SECRET` | *(derived from the JWT secret)* | key for signed download links |
+| `DSH_PUBLIC_API_URL` | `https://api.<domain>` | where download links point |
 | `DSH_LIMIT_HEAP_GB` | `3` | free-tier profile served by `GET /api/v1/limits` |
 | `DSH_LIMIT_MEMORY_LIMIT_GIB` | `3.5` | " |
 | `DSH_LIMIT_WORLD_QUOTA_GIB` | `5` | " |
@@ -180,7 +197,7 @@ same numbers the cluster enforces.
 
 `deploy/` holds plain manifests (`kubectl kustomize deploy/` renders them):
 namespace, ServiceAccount + the two ClusterRoles below, ConfigMap, Secret
-stub, two PVCs (state, backups), Deployment, Service and the `api.<domain>`
+stub, three PVCs (state, backups, world exports), Deployment, Service and the `api.<domain>`
 Ingress with the cert-manager annotation. Before applying: build and push the
 image somewhere the cluster can pull from and set it in `deployment.yaml`,
 put the real node address in `config.yaml`, and create the `dsh-api` Secret
@@ -237,7 +254,32 @@ on:
 - Each plugin is pinned to the release that was current when it was added;
   the boot script downloads through DPC's counting URL.
 
-## World export image (RFC 0021)
+## World export (RFC 0021)
+
+Off until `DSH_WORLD_EXPORT=true`; every route answers 503 until then, which
+the portal takes as "hide the section". While it is on:
+
+- `POST .../exports` checks ownership, the server's state, one export per
+  server and the daily limit, records the export `queued` and answers. Exports
+  run **one at a time on the whole node** on their own one-worker executor.
+- A run applies `NetworkPolicy/dsh-export-isolate` (deny all, export pods
+  only) in `t-<name>`, then creates `pod/world-export-<id>`: the export image,
+  the world PVC mounted **read-only**, no service-account token, read-only
+  root, uid 1000, `activeDeadlineSeconds: 900`, 100m/256Mi requests and
+  500m/1Gi limits (room beside an awake release under the hosted-free quota).
+  It execs `dsh-world-export` in it and streams the tar back, exactly as a
+  backup streams `tar`; the pod is deleted whatever happens. No permission
+  beyond `dsh-api-tenant` is needed.
+- No command is ever sent to the game. An asleep server gives an `at_rest`
+  snapshot; an awake one `live_stable`, or `live_changing` if region files
+  kept changing while they were copied.
+- The tar is unpacked accepting only `summary.json`, `world.zip` and
+  `preview/<usd-web file>`, then moved to `DSH_EXPORT_DIR/<server>/<id>/`.
+- Finished and failed exports are removed after `DSH_EXPORT_RETENTION_HOURS`,
+  and with their server; a restart marks running ones failed and deletes their
+  pods.
+
+## World export image
 
 `export/` builds the image the world-export pod runs: Minecraft-USD-Exporter
 and usd-web, each pinned to a commit (`EXPORTER_PIN`, `USD_WEB_PIN`), plus
@@ -267,6 +309,8 @@ src/dsh_api/
   cluster.py   ClusterBackend: kubectl/helm backend + in-memory fake
   service.py   create / list / get / wake / delete
   plugin_service.py  a server's plugin selection: add / remove / apply
+  export_service.py  world export (RFC 0021): start, run, links, expiry
+  export_pod.py      the export pod and policy manifests, the exec stream, unpacking
   catalog.py   the installable plugins: dansplugins.com, cached (real + fake)
   selection.py the selection.json the wrapper reconciles, and its hash
   feedback.py  submit / list / triage user feedback

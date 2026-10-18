@@ -85,6 +85,21 @@ class Settings:
     routes answer 503 and new servers get DEFAULT_PLUGINS as before."""
     dpc_api: str = "https://api.dansplugins.com"
     limits: Limits = field(default_factory=Limits)
+    world_export: bool = False
+    """Owners can export their world as 3D (RFC 0021). Needs the export image
+    on the node (DSH_EXPORT_IMAGE) and the exports volume; until then every
+    export route answers 503."""
+    export_dir: str = "/exports"
+    export_image: str = "dsh-world-export:local"
+    export_default_size: int = 256
+    export_max_size: int = 512
+    export_daily_limit: int = 5
+    export_retention_hours: int = 72
+    export_timeout_seconds: int = 600
+    export_link_secret: str = ""
+    """Key for signed download links; derived from the JWT secret when unset."""
+    public_api_url: str = ""
+    """Where download links point; ``https://api.<base_domain>`` when unset."""
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Settings:
@@ -109,6 +124,20 @@ class Settings:
             plugin_selection=env.get("DSH_PLUGIN_SELECTION", "").lower() in ("1", "true", "yes"),
             dpc_api=env.get("DSH_DPC_API", cls.dpc_api),
             limits=Limits.from_env(env),
+            world_export=env.get("DSH_WORLD_EXPORT", "").lower() in ("1", "true", "yes"),
+            export_dir=env.get("DSH_EXPORT_DIR", cls.export_dir),
+            export_image=env.get("DSH_EXPORT_IMAGE", cls.export_image),
+            export_default_size=int(env.get("DSH_EXPORT_DEFAULT_SIZE", cls.export_default_size)),
+            export_max_size=int(env.get("DSH_EXPORT_MAX_SIZE", cls.export_max_size)),
+            export_daily_limit=int(env.get("DSH_EXPORT_DAILY_LIMIT", cls.export_daily_limit)),
+            export_retention_hours=int(
+                env.get("DSH_EXPORT_RETENTION_HOURS", cls.export_retention_hours)
+            ),
+            export_timeout_seconds=int(
+                env.get("DSH_EXPORT_TIMEOUT_SECONDS", cls.export_timeout_seconds)
+            ),
+            export_link_secret=env.get("DSH_EXPORT_LINK_SECRET", cls.export_link_secret),
+            public_api_url=env.get("DSH_PUBLIC_API_URL", cls.public_api_url),
         )
 
     def is_admin(self, username: str) -> bool:
@@ -119,3 +148,6 @@ class Settings:
 
     def sslip_hostname(self, name: str) -> str:
         return f"{name}.{self.node_ip.replace('.', '-')}.sslip.io"
+
+    def api_url(self) -> str:
+        return (self.public_api_url or f"https://api.{self.base_domain}").rstrip("/")

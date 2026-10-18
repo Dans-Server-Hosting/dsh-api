@@ -131,6 +131,9 @@ class ServerService:
         self.cluster = cluster
         self.uuids = uuids
         self.jobs = jobs
+        self.after_delete: list[Callable[[str], None]] = []
+        """Called with the server's name once a delete has removed it (its
+        world exports go with it, RFC 0021)."""
 
     def recover_interrupted(self) -> None:
         """Rows left ``provisioning`` or ``deleting`` by a process that died mid-job.
@@ -177,6 +180,10 @@ class ServerService:
             last_woken_at=row.last_woken_at,
             players_online=players,
         )
+
+    def state_of(self, name: str) -> str:
+        """The cluster's reading of a created server (``asleep``, ``awake``, ...)."""
+        return self._state(name)
 
     def owned(self, tenant_id: str, name: str) -> ServerRow:
         """The tenant's server row; ``ServerNotFound`` for anyone else's."""
@@ -353,6 +360,11 @@ class ServerService:
             return
         self.db.delete_server(name)
         self.db.record(tenant_id, name, "delete")
+        for hook in self.after_delete:
+            try:
+                hook(name)
+            except Exception:  # the server is gone either way; never fail the delete
+                log.exception("cleaning up after deleting %s failed", name)
 
     def _delete_failed(self, tenant_id: str, name: str, prior: str, kind: str, detail: str) -> None:
         self.db.set_status(name, prior)

@@ -10,7 +10,8 @@ ARG KUBECTL_VERSION=v1.31.4
 ARG HELM_VERSION=v3.16.4
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
-    OMCSI_CHART_DIR=/opt/omcsi DSH_DB_PATH=/data/dsh-api.db DSH_BACKUP_DIR=/backups
+    OMCSI_CHART_DIR=/opt/omcsi DSH_DB_PATH=/data/dsh-api.db DSH_BACKUP_DIR=/backups \
+    DSH_EXPORT_DIR=/exports
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git tar \
@@ -29,7 +30,7 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 RUN pip install --no-cache-dir . \
     && useradd --uid 10001 --create-home dsh \
-    && mkdir -p /data /backups && chown dsh:dsh /data /backups
+    && mkdir -p /data /backups /exports && chown dsh:dsh /data /backups /exports
 USER 10001
 
 EXPOSE 8000

@@ -27,6 +27,10 @@ def test_limits_are_the_free_tier_defaults(client):
         "archive_after_days": 60,
         "backup_retention_days": 14,
         "minecraft_version": "26.2",
+        "export_default_size": 256,
+        "export_max_size": 512,
+        "export_daily_limit": 5,
+        "export_retention_hours": 72,
     }
 
 
