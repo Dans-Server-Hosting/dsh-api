@@ -5,7 +5,7 @@ from dataclasses import asdict
 from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator
 
 from dsh_api import __version__
@@ -14,6 +14,14 @@ from dsh_api.catalog import CatalogUnavailable, DpcCatalog, PluginCatalog
 from dsh_api.cluster import ClusterBackend, ClusterError, KubectlHelmBackend
 from dsh_api.config import Settings
 from dsh_api.db import Database
+from dsh_api.export_service import (
+    ExportConflict,
+    ExportDisabled,
+    ExportLimit,
+    ExportNotFound,
+    ExportService,
+    InvalidArea,
+)
 from dsh_api.feedback import FeedbackNotFound, FeedbackRateLimited, FeedbackService
 from dsh_api.mojang import MojangResolver, UnknownUsername, UuidResolver
 from dsh_api.plugin_service import (
@@ -69,6 +77,19 @@ class ApplyPlugins(BaseModel):
     confirm_players: bool = False
 
 
+class ExportArea(BaseModel):
+    """Two opposite X/Z corners, inclusive block coordinates; every height."""
+
+    x1: int
+    z1: int
+    x2: int
+    z2: int
+
+
+class CreateExport(BaseModel):
+    area: ExportArea | None = None
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -78,6 +99,7 @@ def create_app(
     uuids: UuidResolver | None = None,
     jobs: JobRunner | None = None,
     catalog: PluginCatalog | None = None,
+    export_jobs: JobRunner | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     if not settings.node_ip:
@@ -101,12 +123,19 @@ def create_app(
     feedback = FeedbackService(db)
     catalog = catalog or DpcCatalog(settings.default_plugins, api=settings.dpc_api)
     plugins = PluginService(settings, db, cluster, service, catalog)
+    # One export at a time on the whole node (RFC 0021 §5); the rest wait queued.
+    export_jobs = export_jobs or ThreadPoolExecutor(max_workers=1, thread_name_prefix="dsh-export")
+    exports = ExportService(settings, db, cluster, service, export_jobs)
+    if settings.world_export:
+        exports.recover_interrupted()
+        exports.sweep()
 
     app = FastAPI(title="dsh-api", version=__version__)
     app.state.settings = settings
     app.state.service = service
     app.state.feedback = feedback
     app.state.jobs = jobs
+    app.state.exports = exports
 
     def current_tenant(authorization: Annotated[str | None, Header()] = None) -> str:
         try:
@@ -148,6 +177,33 @@ def create_app(
     def _catalog_unavailable(_: Request, exc: CatalogUnavailable) -> JSONResponse:
         return JSONResponse({"detail": str(exc)}, status_code=503)
 
+    @app.exception_handler(ExportDisabled)
+    def _exports_disabled(_: Request, exc: ExportDisabled) -> JSONResponse:
+        return JSONResponse({"detail": "world export is not enabled"}, status_code=503)
+
+    @app.exception_handler(ExportNotFound)
+    def _export_not_found(_: Request, exc: ExportNotFound) -> JSONResponse:
+        return JSONResponse({"detail": "no such export"}, status_code=404)
+
+    @app.exception_handler(ExportConflict)
+    def _export_conflict(_: Request, exc: ExportConflict) -> JSONResponse:
+        return JSONResponse({"detail": str(exc)}, status_code=409)
+
+    @app.exception_handler(ExportLimit)
+    def _export_limit(_: Request, exc: ExportLimit) -> JSONResponse:
+        return JSONResponse(
+            {
+                "detail": f"at most {exc.limit} exports a day; try again later",
+                "retry_after": exc.retry_after,
+            },
+            status_code=429,
+            headers={"Retry-After": str(exc.retry_after)},
+        )
+
+    @app.exception_handler(InvalidArea)
+    def _invalid_area(_: Request, exc: InvalidArea) -> JSONResponse:
+        return JSONResponse({"detail": str(exc)}, status_code=422)
+
     @app.exception_handler(ServerNotFound)
     def _server_not_found(_: Request, exc: ServerNotFound) -> JSONResponse:
         return JSONResponse({"detail": "no such server"}, status_code=404)
@@ -165,7 +221,11 @@ def create_app(
 
     @app.get("/api/v1/limits")
     def limits() -> dict:
-        return {"servers_per_tenant": settings.max_servers_per_tenant, **asdict(settings.limits)}
+        return {
+            "servers_per_tenant": settings.max_servers_per_tenant,
+            **asdict(settings.limits),
+            **exports.limits(),
+        }
 
     @app.get("/api/v1/default-plugins")
     def default_plugins() -> list[dict]:
@@ -281,6 +341,55 @@ def create_app(
                 },
                 status_code=409,
             )
+
+    # --- world export (RFC 0021); 503 while DSH_WORLD_EXPORT is off ------------
+
+    @app.get("/api/v1/servers/{name}/exports")
+    def list_exports(tenant: Tenant, name: str) -> dict:
+        """The server's unexpired exports, newest first."""
+        return {"exports": exports.list(tenant, name)}
+
+    @app.post("/api/v1/servers/{name}/exports", status_code=202)
+    def create_export(tenant: Tenant, name: str, body: CreateExport | None = None) -> dict:
+        """Start an export: by default 256 × 256 blocks around spawn at every
+        height, or ``area``. Answers at once with the export ``queued``; poll it
+        until ``ready`` or ``failed``. Never writes the world or pauses the game."""
+        area = (body or CreateExport()).area
+        corners = (area.x1, area.z1, area.x2, area.z2) if area else None
+        return exports.create(tenant, name, corners)
+
+    @app.get("/api/v1/servers/{name}/exports/{export_id}")
+    def get_export(tenant: Tenant, name: str, export_id: str) -> dict:
+        return exports.get(tenant, name, export_id)
+
+    @app.delete("/api/v1/servers/{name}/exports/{export_id}", status_code=204)
+    def delete_export(tenant: Tenant, name: str, export_id: str) -> Response:
+        exports.delete(tenant, name, export_id)
+        return Response(status_code=204)
+
+    @app.get("/api/v1/servers/{name}/exports/{export_id}/preview/{file}")
+    def export_preview(tenant: Tenant, name: str, export_id: str, file: str) -> FileResponse:
+        """A usd-web preview file: ``index.json`` or a ``.uwt`` tile (gzip
+        bytes the viewer unpacks itself)."""
+        path = exports.preview_file(tenant, name, export_id, file)
+        media = "application/json" if file == "index.json" else "application/octet-stream"
+        return FileResponse(path, media_type=media, headers={"Cache-Control": "private"})
+
+    @app.post("/api/v1/servers/{name}/exports/{export_id}/link")
+    def export_link(tenant: Tenant, name: str, export_id: str) -> dict:
+        """A signed link to the zip, valid for 15 minutes, that needs no token."""
+        return exports.link(tenant, name, export_id)
+
+    @app.get("/api/v1/export-downloads/{token}")
+    def export_download(token: str) -> FileResponse:
+        """No Bearer token: the signed link is the credential."""
+        path, filename = exports.download(token)
+        return FileResponse(
+            path,
+            media_type="application/zip",
+            filename=filename,
+            headers={"Cache-Control": "private, no-store"},
+        )
 
     @app.get("/api/v1/me")
     def me(tenant: Tenant) -> dict:

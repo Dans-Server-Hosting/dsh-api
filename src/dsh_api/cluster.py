@@ -15,10 +15,22 @@ import struct
 import subprocess
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
+
+from dsh_api.export_pod import (
+    EXPORT_LABEL,
+    READY_TIMEOUT,
+    UnsafeArchive,
+    export_network_policy,
+    export_pod_manifest,
+    export_pod_name,
+    extract_export,
+    stream_command,
+)
 
 TENANT_CLUSTER_ROLE = "dsh-api-tenant"
 """The ClusterRole with the namespaced rules (deploy/rbac.yaml), bound into
@@ -173,6 +185,27 @@ class ClusterBackend(Protocol):
     def restart_wrapper_pod(self, name: str) -> None:
         """Delete the wrapper pod so the StatefulSet recreates it. A pod start,
         not the wrapper's own restart, is what re-runs the boot script."""
+
+    def run_world_export(
+        self,
+        name: str,
+        export_id: str,
+        *,
+        image: str,
+        args: list[str],
+        dest: Path,
+        timeout: float,
+        on_phase: Callable[[str], None],
+    ) -> None:
+        """Run one world export (RFC 0021) and unpack its results into ``dest``.
+
+        Starts the export pod in ``t-<name>`` with the world volume mounted
+        read-only, runs ``dsh-world-export <args>`` in it, and always deletes
+        the pod. ``on_phase`` gets the pod's ``phase=`` progress. Raises
+        ``ClusterError`` with a message fit for the owner."""
+
+    def delete_world_export_pods(self, name: str) -> None:
+        """Remove any export pods left in ``t-<name>`` (after an API restart)."""
 
     def uninstall_release(self, name: str) -> None: ...
 
@@ -456,6 +489,20 @@ def http_json(
     return status, body
 
 
+def export_failure_message(code: int, tail: list[str]) -> str:
+    """The owner-facing reason an export run failed, from its exit status and
+    the last lines of its stderr. dsh-world-export's own ``error:`` lines are
+    written for the owner and carry no paths."""
+    if code == -9:
+        return "the export took too long and was stopped; try a smaller area"
+    if code == 137:
+        return "the export ran out of memory; try a smaller area"
+    for line in reversed(tail):
+        if line.startswith("error: "):
+            return line.removeprefix("error: ")[:300]
+    return f"the export failed (exit status {code})"
+
+
 class KubectlHelmBackend:
     def __init__(
         self,
@@ -465,6 +512,7 @@ class KubectlHelmBackend:
         service_account: tuple[str, str] = ("dsh-api", "dsh-api"),
         run=run_command,
         http=http_json,
+        stream=stream_command,
     ) -> None:
         self.omcsi_dir = omcsi_dir
         self.backup_dir = Path(backup_dir)
@@ -473,6 +521,7 @@ class KubectlHelmBackend:
         """``(namespace, name)`` of the ServiceAccount the API runs as."""
         self._run = run
         self._http = http
+        self._stream = stream
 
     def namespace_exists(self, name: str) -> bool:
         try:
@@ -707,6 +756,94 @@ class KubectlHelmBackend:
             f"{name}{WRAPPER_STS_SUFFIX}-0", "--wait=false",
         ])  # fmt: skip
 
+    def run_world_export(
+        self,
+        name: str,
+        export_id: str,
+        *,
+        image: str,
+        args: list[str],
+        dest: Path,
+        timeout: float,
+        on_phase: Callable[[str], None],
+    ) -> None:
+        ns = namespace_for(name)
+        claim = f"{name}{WRAPPER_PVC_SUFFIX}"
+        self._run(["kubectl", "apply", "-f", "-"], stdin=json.dumps(export_network_policy(ns)))
+        # As in backup_world: without the claim the pod would sit Pending.
+        try:
+            self._run(["kubectl", "-n", ns, "get", "pvc", claim, "-o", "name"])
+        except ClusterError as exc:
+            raise ClusterError("the server has no world yet") from exc
+        pod = export_pod_name(export_id)
+        manifest = export_pod_manifest(ns, export_id, claim, image)
+        try:
+            self._run(["kubectl", "apply", "-f", "-"], stdin=json.dumps(manifest))
+        except ClusterError as exc:
+            if "exceeded quota" in str(exc):
+                raise ClusterError(
+                    "the server has no room for an export right now; try again while it is asleep"
+                ) from exc
+            raise
+        try:
+            try:
+                self._run([
+                    "kubectl", "-n", ns, "wait", "--for=condition=Ready", f"pod/{pod}",
+                    f"--timeout={READY_TIMEOUT}",
+                ])  # fmt: skip
+            except ClusterError as exc:
+                raise ClusterError(self._export_pod_problem(ns, pod)) from exc
+            dest.mkdir(parents=True, exist_ok=True)
+            archive = dest / "export.tgz"
+
+            def progress(line: str) -> None:
+                if line.startswith("phase="):
+                    on_phase(line.removeprefix("phase=").strip())
+
+            try:
+                code, tail = self._stream(
+                    ["kubectl", "-n", ns, "exec", pod, "--", "dsh-world-export", *args],
+                    archive,
+                    progress,
+                    timeout,
+                )
+                if code != 0:
+                    raise ClusterError(export_failure_message(code, tail))
+                extract_export(archive, dest)
+            except UnsafeArchive as exc:
+                raise ClusterError(str(exc)) from exc
+            finally:
+                archive.unlink(missing_ok=True)
+        finally:
+            # Best effort, as for the backup reader: activeDeadlineSeconds ends
+            # a pod that will not go away.
+            try:
+                self._run(["kubectl", "-n", ns, "delete", "pod", pod, "--wait=false"])
+            except ClusterError:
+                pass
+
+    def _export_pod_problem(self, ns: str, pod: str) -> str:
+        """Why the export pod did not become Ready, in the owner's terms."""
+        try:
+            raw = self._run(["kubectl", "-n", ns, "get", "pod", pod, "-o", "json"])
+            status = json.loads(raw).get("status", {})
+        except (ClusterError, ValueError):
+            return "the export could not be started"
+        for cs in status.get("containerStatuses", []):
+            reason = (cs.get("state", {}).get("waiting") or {}).get("reason", "")
+            if reason in ("ErrImagePull", "ImagePullBackOff", "ErrImageNeverPull"):
+                return "the export image is not available on the cluster"
+        for cond in status.get("conditions", []):
+            if cond.get("reason") == "Unschedulable":
+                return "the server has no room for an export right now; try again later"
+        return "the export pod did not start in time"
+
+    def delete_world_export_pods(self, name: str) -> None:
+        self._run([
+            "kubectl", "-n", namespace_for(name), "delete", "pod", "-l", f"{EXPORT_LABEL}=true",
+            "--wait=false", "--ignore-not-found",
+        ])  # fmt: skip
+
     def uninstall_release(self, name: str) -> None:
         """Idempotent: a release that is already gone (an earlier attempt, or
         the operator's script, got that far) is not an error on the way out."""
@@ -761,6 +898,11 @@ class FakeClusterBackend:
     applied: dict[str, dict] = field(default_factory=dict)
     """Per server, what its wrapper reports at /api/plugins/applied."""
     commands: list[tuple[str, str]] = field(default_factory=list)
+    export_summaries: dict[str, dict] = field(default_factory=dict)
+    """Per server, what the next export's summary.json says (merged over a default)."""
+    export_failures: dict[str, str] = field(default_factory=dict)
+    """Per server, the owner-facing error the next export fails with."""
+    exports_run: list[tuple[str, str, tuple[str, ...]]] = field(default_factory=list)
     ops: list[tuple] = field(default_factory=list)
     fail_on: set[str] = field(default_factory=set)
 
@@ -887,6 +1029,53 @@ class FakeClusterBackend:
             "selection_sha256": hashlib.sha256(selection.encode()).hexdigest(),
             "plugins": {p["slug"]: "installed" for p in plugins},
         }
+
+    def run_world_export(
+        self,
+        name: str,
+        export_id: str,
+        *,
+        image: str,
+        args: list[str],
+        dest: Path,
+        timeout: float,
+        on_phase: Callable[[str], None],
+    ) -> None:
+        self._op("run_world_export", name, export_id)
+        self._require_binding(name)
+        if name not in self.releases:
+            raise ClusterError("the server has no world yet")
+        self.exports_run.append((name, export_id, tuple(args)))
+        for phase in ("copying", "exporting"):
+            on_phase(phase)
+        if name in self.export_failures:
+            raise ClusterError(self.export_failures.pop(name))
+        on_phase("preview")
+        on_phase("packaging")
+        area = {"x1": -128, "z1": -128, "x2": 127, "z2": 127}
+        if "--area" in args:
+            i = args.index("--area")
+            x1, z1, x2, z2 = (int(v) for v in args[i + 1 : i + 5])
+            area = {"x1": min(x1, x2), "z1": min(z1, z2), "x2": max(x1, x2), "z2": max(z1, z2)}
+        state = args[args.index("--server-state") + 1] if "--server-state" in args else "awake"
+        summary = {
+            "version": 1,
+            "area": area,
+            "custom_area": "--area" in args,
+            "spawn": {"x": 0, "z": 0},
+            "snapshot": "at_rest" if state == "asleep" else "live_stable",
+            "stats": {"blocks_scanned": 1000, "instances": 100, "zip_bytes": 0},
+        }
+        summary.update(self.export_summaries.get(name, {}))
+        (dest / "preview").mkdir(parents=True, exist_ok=True)
+        (dest / "world.zip").write_bytes(b"PK fake zip of " + name.encode())
+        (dest / "preview" / "index.json").write_text('{"format": "usd-web-index"}')
+        (dest / "preview" / "t.0.0.0123456789ab.uwt").write_bytes(b"\x1f\x8b fake tile")
+        summary["stats"]["zip_bytes"] = (dest / "world.zip").stat().st_size
+        (dest / "summary.json").write_text(json.dumps(summary))
+
+    def delete_world_export_pods(self, name: str) -> None:
+        self._op("delete_world_export_pods", name)
 
     def uninstall_release(self, name: str) -> None:
         self._op("uninstall_release", name)

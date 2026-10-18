@@ -19,3 +19,16 @@ spec:
   resources:
     requests:
       storage: 20Gi
+---
+# World exports (RFC 0021): zips and preview tiles, kept 72 hours. Its own
+# volume so a burst of exports can never fill the space a delete's backup needs.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dsh-api-exports
+  namespace: dsh-api
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi

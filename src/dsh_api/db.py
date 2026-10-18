@@ -55,6 +55,23 @@ CREATE TABLE IF NOT EXISTS server_plugins (
     added_at TEXT NOT NULL,
     PRIMARY KEY (server, slug)
 );
+CREATE TABLE IF NOT EXISTS world_exports (
+    id TEXT PRIMARY KEY,
+    server TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    phase TEXT,
+    x1 INTEGER, z1 INTEGER, x2 INTEGER, z2 INTEGER,
+    custom_area INTEGER NOT NULL DEFAULT 0,
+    snapshot TEXT,
+    stats TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    finished_at TEXT,
+    expires_at TEXT
+);
+CREATE INDEX IF NOT EXISTS world_exports_server ON world_exports(server);
+CREATE INDEX IF NOT EXISTS world_exports_tenant ON world_exports(tenant_id, created_at);
 CREATE TABLE IF NOT EXISTS server_plugin_state (
     server TEXT PRIMARY KEY,
     seeded_at TEXT NOT NULL,
@@ -118,6 +135,36 @@ class PluginState:
     """Hash of the selection last written to the server's ConfigMap."""
     applied_sha256: str | None
     """Hash of the selection the server last reported applying at boot."""
+
+
+@dataclass(frozen=True)
+class ExportRow:
+    """One world export (RFC 0021). ``x1..z2`` are None for a box around spawn
+    until the pod has resolved it."""
+
+    id: str
+    server: str
+    tenant_id: str
+    status: str
+    phase: str | None
+    x1: int | None
+    z1: int | None
+    x2: int | None
+    z2: int | None
+    custom_area: bool
+    snapshot: str | None
+    stats: dict | None
+    error: str | None
+    created_at: str
+    finished_at: str | None
+    expires_at: str | None
+
+
+def _export_row(row: sqlite3.Row) -> ExportRow:
+    data = dict(row)
+    data["custom_area"] = bool(data["custom_area"])
+    data["stats"] = json.loads(data["stats"]) if data["stats"] else None
+    return ExportRow(**data)
 
 
 @dataclass(frozen=True)
@@ -377,3 +424,85 @@ class Database:
         with self._connect() as conn:
             conn.execute("UPDATE feedback SET status = ? WHERE id = ?", (status, feedback_id))
         return self.get_feedback(feedback_id)
+
+    # --- world exports (RFC 0021) ----------------------------------------------
+
+    def insert_export(
+        self, export_id: str, server: str, tenant_id: str, area: tuple[int, int, int, int] | None
+    ) -> ExportRow:
+        x1, z1, x2, z2 = area if area else (None, None, None, None)
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO world_exports (id, server, tenant_id, status, x1, z1, x2, z2,"
+                " custom_area, created_at) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)",
+                (export_id, server, tenant_id, x1, z1, x2, z2, int(area is not None), now_iso()),
+            )
+        row = self.get_export(export_id)
+        assert row is not None
+        return row
+
+    def get_export(self, export_id: str) -> ExportRow | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM world_exports WHERE id = ?", (export_id,)).fetchone()
+        return _export_row(row) if row else None
+
+    def list_exports(self, server: str, tenant_id: str) -> list[ExportRow]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM world_exports WHERE server = ? AND tenant_id = ?"
+                " ORDER BY created_at DESC, rowid DESC",
+                (server, tenant_id),
+            ).fetchall()
+        return [_export_row(r) for r in rows]
+
+    def exports_with_status(self, *statuses: str) -> list[ExportRow]:
+        marks = ",".join("?" * len(statuses))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM world_exports WHERE status IN ({marks})", statuses
+            ).fetchall()
+        return [_export_row(r) for r in rows]
+
+    def all_exports(self) -> list[ExportRow]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM world_exports").fetchall()
+        return [_export_row(r) for r in rows]
+
+    def count_exports_since(self, tenant_id: str, window: timedelta) -> tuple[int, str | None]:
+        """How many exports the tenant started within ``window``, and the oldest
+        of those start times (when the next one frees up)."""
+        since = _iso(datetime.now(UTC) - window)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM world_exports"
+                " WHERE tenant_id = ? AND created_at > ?",
+                (tenant_id, since),
+            ).fetchone()
+        return int(row["n"]), row["oldest"]
+
+    def update_export(self, export_id: str, **fields: object) -> None:
+        allowed = {
+            "status", "phase", "x1", "z1", "x2", "z2", "snapshot", "stats", "error",
+            "finished_at", "expires_at",
+        }  # fmt: skip
+        if not fields or not set(fields) <= allowed:
+            raise ValueError(f"cannot update {sorted(set(fields) - allowed)}")
+        values = [json.dumps(v) if k == "stats" and v is not None else v for k, v in fields.items()]
+        assignments = ", ".join(f"{k} = ?" for k in fields)
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE world_exports SET {assignments} WHERE id = ?", (*values, export_id)
+            )
+
+    def delete_export(self, export_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM world_exports WHERE id = ?", (export_id,))
+
+    def delete_exports_of(self, server: str) -> list[str]:
+        with self._connect() as conn:
+            ids = [
+                r["id"]
+                for r in conn.execute("SELECT id FROM world_exports WHERE server = ?", (server,))
+            ]
+            conn.execute("DELETE FROM world_exports WHERE server = ?", (server,))
+        return ids

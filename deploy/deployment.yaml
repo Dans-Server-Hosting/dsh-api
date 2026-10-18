@@ -72,6 +72,8 @@ spec:
               mountPath: /data
             - name: backups
               mountPath: /backups
+            - name: exports
+              mountPath: /exports
       volumes:
         - name: state
           persistentVolumeClaim:
@@ -79,6 +81,9 @@ spec:
         - name: backups
           persistentVolumeClaim:
             claimName: dsh-api-backups
+        - name: exports
+          persistentVolumeClaim:
+            claimName: dsh-api-exports
 ---
 apiVersion: v1
 kind: Service
