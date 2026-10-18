@@ -535,6 +535,7 @@ def test_the_pod_mounts_the_world_read_only_with_no_token_or_network() -> None:
     assert mount["readOnly"] is True and mount["mountPath"] == "/mcserver"
     assert spec["automountServiceAccountToken"] is False
     assert spec["activeDeadlineSeconds"] == 900 and spec["restartPolicy"] == "Never"
+    assert spec["terminationGracePeriodSeconds"] == 1
     sc = spec["containers"][0]["securityContext"]
     assert sc["readOnlyRootFilesystem"] and not sc["allowPrivilegeEscalation"]
     assert spec["securityContext"]["runAsUser"] == 1000

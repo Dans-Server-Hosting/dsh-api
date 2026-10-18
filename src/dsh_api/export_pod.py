@@ -52,6 +52,10 @@ def export_pod_manifest(namespace: str, export_id: str, claim: str, image: str) 
         "spec": {
             "restartPolicy": "Never",
             "activeDeadlineSeconds": POD_DEADLINE_SECONDS,
+            # `sleep` as PID 1 ignores SIGTERM, so the default 30 s grace would
+            # keep a finished pod (and its share of the namespace quota, which
+            # an awake release leaves exactly full) for half a minute.
+            "terminationGracePeriodSeconds": 1,
             "automountServiceAccountToken": False,
             "enableServiceLinks": False,
             "securityContext": {
