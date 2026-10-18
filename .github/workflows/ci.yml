@@ -24,3 +24,12 @@ jobs:
       - uses: actions/checkout@v4
       - run: docker build -t dsh-api:ci .
       - run: docker run --rm dsh-api:ci sh -c 'kubectl version --client && helm version && test -f /opt/omcsi/helm/omcsi/values-colocated.yaml'
+
+  # The world-export image (RFC 0021): build it, then run it against the
+  # committed fixture server the way the pod does (read-only world, no network).
+  export-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t dsh-world-export:ci export/
+      - run: export/smoke.sh dsh-world-export:ci
