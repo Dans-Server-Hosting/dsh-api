@@ -5,7 +5,7 @@
 ## Shape
 
 - Python 3.11, FastAPI, stdlib-heavy. Chosen because everything it drives today is `kubectl`/`helm`/bash and the fleet control plane it will defer to later is Python; a JVM service would wrap shell commands from the wrong side of the fence.
-- Runs **in the cluster**, in its own namespace, with a ServiceAccount whose Role can create namespaces, ResourceQuotas and Helm releases — and nothing else. It never holds a kubeconfig file.
+- Runs **in the cluster**, in its own namespace, with a ServiceAccount whose Role can create namespaces, ResourceQuotas and Helm releases — and nothing else. It never holds a kubeconfig file. *Since the MVP: the grant is split into a small cluster-wide role and a tenant role bound only inside each `t-<name>` namespace; see Permission model in the README.*
 - Authenticates callers with UserAuth JWTs (`Authorization: Bearer`), validated with the shared HS256 secret (or `GET /session/validate` against the UserAuth service). The JWT `sub` is the tenant id. No local user table beyond a `tenants` row created on first call.
 - State: one SQLite file on a small PVC (tenants, servers, events). The cluster is the source of truth for whether a server exists; the database records who owns what and what was asked for.
 
@@ -59,7 +59,12 @@ event.
 ## Not in the MVP
 
 - Quotas beyond "N servers per tenant"; billing; anything paid.
-- Plugin or world upload — the OMCSI dashboard already does both.
+- Plugin or world upload — the OMCSI dashboard already does both. *Since
+  the MVP: every new server starts with the default plugins
+  (`GET /api/v1/default-plugins`), and tenants can choose plugins from the
+  Dan's Plugins catalog (`/api/v1/catalog`, `/api/v1/servers/{name}/plugins`)
+  once `DSH_PLUGIN_SELECTION` is on; see Plugin selection in the README.
+  Uploading a jar or a world is still the dashboard's job.*
 - An admin API (the operator uses the cluster scripts). *Since the MVP: user
   feedback (`POST /api/v1/feedback`, listed and triaged by the `DSH_ADMIN_USERS`
   logins) and `GET /api/v1/me` were added for the portal; server administration
