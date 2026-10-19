@@ -1,10 +1,11 @@
 # syntax=docker/dockerfile:1
 FROM python:3.11-slim
 
-# A commit on OMCSI main, the same one dsh-cluster/scripts/lib.sh pins: the
-# merge of #309, whose chart mounts the optional <release>-plugins ConfigMap
-# this API writes for plugin selection (RFC 0020). A pin must stay reachable
-# from main (an earlier one on a deleted stacked branch broke `git clone`).
+# A commit on OMCSI main, the same one the cluster's provisioning scripts
+# pin: the merge of #309, whose chart mounts the optional <release>-plugins
+# ConfigMap this API writes for plugin selection (RFC 0020). A pin must stay
+# reachable from main (an earlier one on a deleted stacked branch broke
+# `git clone`).
 ARG OMCSI_PIN=003c12df743dc9642d254fb57040455679830499
 ARG KUBECTL_VERSION=v1.31.4
 ARG HELM_VERSION=v3.16.4
