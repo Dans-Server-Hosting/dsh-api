@@ -26,7 +26,7 @@ driven through the public API (see the MVP done-when list).
   cluster or the network.
 - State is one SQLite file: `tenants`, `servers` (who owns what, and whether
   its create is still in flight), `events`, `feedback` (what signed-in
-  people said about the portal, for the admins), and `server_plugins` /
+  people said about the portal, for the admins), `server_plugins` /
   `server_plugin_state` (each server's plugin selection, and the hashes of
   the selection last written to its ConfigMap and the one the wrapper last
   reported applying at boot), and `world_exports` (each world export's
