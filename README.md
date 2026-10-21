@@ -26,10 +26,12 @@ driven through the public API (see the MVP done-when list).
   cluster or the network.
 - State is one SQLite file: `tenants`, `servers` (who owns what, and whether
   its create is still in flight), `events`, `feedback` (what signed-in
-  people said about the portal, for the admins), and `server_plugins` /
+  people said about the portal, for the admins), `server_plugins` /
   `server_plugin_state` (each server's plugin selection, and the hashes of
   the selection last written to its ConfigMap and the one the wrapper last
-  reported applying at boot). Once a server is created the
+  reported applying at boot), and `world_exports` (each world export's
+  status, box, snapshot kind and expiry; the files themselves are under
+  `DSH_EXPORT_DIR`). Once a server is created the
   cluster is the source of truth for whether it exists and what state it is
   in: the wrapper StatefulSet says whether the pod is up, and the wrapper's
   own API (`/api/server/status` on its internal Service, port 8092) says
