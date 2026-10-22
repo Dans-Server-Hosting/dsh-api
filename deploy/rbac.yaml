@@ -12,10 +12,10 @@
 #   ClusterRole it may reference.
 # - dsh-api-tenant holds the namespaced rules (the Secret, what the OMCSI chart
 #   renders, the wrapper's scale subresource, exec into the wrapper pod for
-#   backups and into the world-export pod). It is bound by a RoleBinding that the API creates in each
-#   t-<name> namespace right after the namespace itself, so these verbs work
-#   only where a binding exists: never in dsh-api, kube-system or another
-#   platform namespace.
+#   backups and into the world-export pod). It is bound by a RoleBinding that
+#   the API creates in each t-<name> namespace right after the namespace
+#   itself, so these verbs work only where a binding exists: never in
+#   dsh-api, kube-system or another platform namespace.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
