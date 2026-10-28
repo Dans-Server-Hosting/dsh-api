@@ -16,7 +16,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from dsh_api.auth import FakeValidator
-from dsh_api.cluster import ClusterError, KubectlHelmBackend, StatefulSetStatus
+from dsh_api.cluster import (
+    ClusterError,
+    KubectlHelmBackend,
+    StatefulSetStatus,
+    export_failure_message,
+)
 from dsh_api.export_pod import (
     MAX_MEMBERS,
     UnsafeArchive,
@@ -192,6 +197,37 @@ def test_bad_areas_are_422(api, alpha, area) -> None:
 
 def test_the_largest_area_is_accepted(api, alpha) -> None:
     assert start(api, {"area": {"x1": 0, "z1": 0, "x2": 511, "z2": 511}}).status_code == 202
+
+
+@pytest.mark.parametrize(
+    "area",
+    [
+        {"x1": 29_999_974, "z1": 0, "x2": 29_999_984, "z2": 10},
+        {"x1": -29_999_984, "z1": -29_999_984, "x2": -29_999_974, "z2": -29_999_974},
+    ],
+)
+def test_an_area_reaching_the_world_border_is_accepted(api, alpha, area) -> None:
+    assert start(api, {"area": area}).status_code == 202
+
+
+@pytest.mark.parametrize(
+    ("area", "detail"),
+    [
+        (
+            {"x1": 29_999_975, "z1": 0, "x2": 29_999_985, "z2": 10},
+            "coordinates must be inside the world border",
+        ),
+        (
+            {"x1": 0, "z1": -29_999_985, "x2": 10, "z2": -29_999_975},
+            "coordinates must be inside the world border",
+        ),
+        ({"x1": 0, "z1": 0, "x2": 512, "z2": 10}, "the area can be at most 512 × 512 blocks"),
+    ],
+)
+def test_a_refused_area_says_why(api, alpha, area, detail) -> None:
+    resp = start(api, {"area": area})
+    assert resp.status_code == 422
+    assert resp.json() == {"detail": detail}
 
 
 def test_one_export_at_a_time_per_server(api, alpha, export_jobs) -> None:
@@ -595,6 +631,26 @@ def test_a_failing_run_is_explained_and_the_pod_deleted(tmp_path, code, stderr, 
         go(backend(run, Stream(b"", code=code, stderr=stderr), tmp_path), tmp_path / "d")
     assert "delete pod world-export" in " ".join(run.calls[-1][0])
     assert not (tmp_path / "d" / "export.tgz").exists()
+
+
+def test_the_last_error_line_is_the_reason() -> None:
+    tail = ["error: first", "phase=exporting", "error: second", "Traceback (most recent call last)"]
+    assert export_failure_message(1, tail) == "second"
+
+
+def test_a_long_error_line_is_cut_to_300_characters() -> None:
+    assert export_failure_message(2, ["error: " + "x" * 400]) == "x" * 300
+
+
+@pytest.mark.parametrize(
+    ("code", "start_of"), [(137, "the export ran out"), (-9, "the export took")]
+)
+def test_a_kill_is_reported_over_an_error_line(code, start_of) -> None:
+    assert export_failure_message(code, ["error: something else"]).startswith(start_of)
+
+
+def test_an_error_line_must_start_the_line() -> None:
+    assert export_failure_message(4, ["  error: indented"]) == "the export failed (exit status 4)"
 
 
 def test_unexpected_archive_entries_are_refused(tmp_path) -> None:
