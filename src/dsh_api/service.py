@@ -60,7 +60,7 @@ def server_state(
 
 
 def validate_name(name: str) -> str:
-    if not NAME_PATTERN.match(name):
+    if not NAME_PATTERN.fullmatch(name):
         raise ValueError("name must be lowercase letters, digits and dashes, 2-31 characters")
     if "omcsi" in name:
         raise ValueError("name must not contain 'omcsi'")
