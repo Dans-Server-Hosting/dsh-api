@@ -658,6 +658,7 @@ def test_unexpected_archive_entries_are_refused(tmp_path) -> None:
         {**GOOD, "playerdata/abc.dat": b"x"},
         {**GOOD, "../escape": b"x"},
         {**GOOD, "preview/../../x.json": b"x"},
+        {**GOOD, "preview/index.json\n": b"x"},
         {k: v for k, v in GOOD.items() if k != "world.zip"},
     ):
         run = Runner()
