@@ -105,7 +105,8 @@ def test_create_with_unknown_operator_is_422_and_provisions_nothing(client, clus
 
 
 @pytest.mark.parametrize(
-    "name", ["A", "Alpha", "1abc", "a", "has_underscore", "my-omcsi", "omcsi", "a" * 32, "ünï"]
+    "name",
+    ["A", "Alpha", "1abc", "a", "has_underscore", "my-omcsi", "omcsi", "a" * 32, "ünï", "alpha\n"],
 )
 def test_create_rejects_bad_names(client, cluster, name):
     resp = client.post("/api/v1/servers", json={"name": name}, headers=ALICE)

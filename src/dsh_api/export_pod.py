@@ -149,7 +149,7 @@ def _allowed(name: str) -> bool:
     if name in ("summary.json", "world.zip"):
         return True
     head, _, file = name.partition("/")
-    return head == "preview" and bool(PREVIEW_FILE_RE.match(file))
+    return head == "preview" and bool(PREVIEW_FILE_RE.fullmatch(file))
 
 
 def extract_export(archive: Path, dest: Path) -> list[str]:
