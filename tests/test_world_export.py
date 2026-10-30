@@ -633,6 +633,19 @@ def test_a_failing_run_is_explained_and_the_pod_deleted(tmp_path, code, stderr, 
     assert not (tmp_path / "d" / "export.tgz").exists()
 
 
+def test_leftover_export_pods_are_deleted_by_label_in_the_tenant_namespace(tmp_path) -> None:
+    run = Runner()
+    backend(run, Stream(b""), tmp_path).delete_world_export_pods("alpha")
+    assert [argv for argv, _ in run.calls] == [
+        [
+            "kubectl", "-n", "t-alpha", "delete", "pod", "-l", "dsh.export=true",
+            "--wait=false", "--ignore-not-found",
+        ]
+    ]  # fmt: skip
+    pod = export_pod_manifest("t-alpha", "0123456789ab", "alpha-omcsi-mcserver", "img")
+    assert pod["metadata"]["labels"]["dsh.export"] == "true"
+
+
 def test_the_last_error_line_is_the_reason() -> None:
     tail = ["error: first", "phase=exporting", "error: second", "Traceback (most recent call last)"]
     assert export_failure_message(1, tail) == "second"
