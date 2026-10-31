@@ -1,3 +1,4 @@
+import json
 import time
 
 import jwt
@@ -54,6 +55,18 @@ def test_hs256_validator_requires_sub():
     no_sub = jwt.encode({"name": "x"}, SECRET, algorithm="HS256")
     with pytest.raises(InvalidToken):
         Hs256Validator(SECRET).validate(no_sub)
+
+
+def test_hs256_validator_rejects_an_empty_sub():
+    with pytest.raises(InvalidToken, match="sub"):
+        Hs256Validator(SECRET).validate(token(sub=""))
+
+
+def test_hs256_validator_rejects_a_non_string_sub():
+    # Signed at the JWS layer: newer PyJWT refuses to encode a non-string sub.
+    numeric = jwt.api_jws.encode(json.dumps({"sub": 42}).encode(), SECRET, algorithm="HS256")
+    with pytest.raises(InvalidToken):
+        Hs256Validator(SECRET).validate(numeric)
 
 
 def test_hs256_validator_rejects_none_algorithm():
