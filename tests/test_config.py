@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CONFIG_SOURCE = (ROOT / "src" / "dsh_api" / "config.py").read_text()
 ROW = re.compile(r"^\| `([A-Z][A-Z0-9_]*)` \| (.+?) \|", re.MULTILINE)
 FLAGS = ("DSH_PLUGIN_SELECTION", "DSH_WORLD_EXPORT")
+LITERAL = re.compile(r"`[^`<>]+`")  # a `<placeholder>` default is a template, not a value
 
 
 def readme_table() -> dict[str, str]:
@@ -40,7 +41,7 @@ def test_every_documented_variable_changes_the_settings(variable):
     sorted(
         (variable, cell[1:-1])
         for variable, cell in readme_table().items()
-        if re.fullmatch(r"`[^`]+`", cell)
+        if LITERAL.fullmatch(cell)
     ),
 )
 def test_setting_a_variable_to_its_documented_default_changes_nothing(variable, default):
@@ -48,8 +49,9 @@ def test_setting_a_variable_to_its_documented_default_changes_nothing(variable, 
 
 
 def test_the_literal_defaults_checked_above_cover_most_of_the_table():
-    literal = [cell for cell in readme_table().values() if re.fullmatch(r"`[^`]+`", cell)]
-    assert len(literal) >= 25  # prose defaults (required, derived, the plugin jars) are skipped
+    literal = [cell for cell in readme_table().values() if LITERAL.fullmatch(cell)]
+    assert len(literal) >= 25  # prose and templated defaults (required, derived, the
+    # plugin jars, https://api.<domain>) are skipped
 
 
 @pytest.mark.parametrize("variable", FLAGS)
