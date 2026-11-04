@@ -246,6 +246,15 @@ def test_the_last_slot_taken_during_the_lookup_is_403(client, db, jobs, resolver
     assert jobs.pending == []
 
 
+def test_a_lost_reservation_is_refused_once_the_winner_has_gone(client, db, jobs, monkeypatch):
+    # The row that took the name can be deleted before the recheck looks for it.
+    monkeypatch.setattr(db, "reserve_server", lambda *args: None)
+    resp = client.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE)
+    assert resp.status_code == 409, resp.text
+    assert db.get_server("alpha") is None
+    assert jobs.pending == []
+
+
 def test_one_of_many_concurrent_reservations_wins(db):
     db.ensure_tenant("alice")
     start = threading.Barrier(8)
