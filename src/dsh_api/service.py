@@ -210,12 +210,8 @@ class ServerService:
         returns; ``get``/``list`` report ``provisioning`` from the row until
         the job has moved it on.
         """
-        pending = self.db.provisioning_server(tenant_id)
-        if pending is not None:
-            raise CreateInProgress(pending.name)
-        if self.db.count_servers(tenant_id) >= self.settings.max_servers_per_tenant:
-            raise TenantAtCap(tenant_id)
-        if self.db.get_server(name) is not None or self.cluster.namespace_exists(name):
+        self._refuse_create(tenant_id, name)
+        if self.cluster.namespace_exists(name):
             raise NameTaken(name)
         operator_uuid = self.uuids.resolve(operator_username) if operator_username else None
         motd = motd or f"{name} on Dan's Server Hosting"
@@ -232,12 +228,32 @@ class ServerService:
             default_plugins=() if self.settings.plugin_selection else self.settings.default_plugins,
         )
         creds = Credentials.generate()
-        row = self.db.insert_server(
-            name, tenant_id, spec.hostname, motd, operator_username, status="provisioning"
+        # The checks above asked kubectl and Mojang, which takes a while; the
+        # reservation is what decides between requests that both passed them.
+        row = self.db.reserve_server(
+            name,
+            tenant_id,
+            spec.hostname,
+            motd,
+            operator_username,
+            self.settings.max_servers_per_tenant,
         )
+        if row is None:
+            self._refuse_create(tenant_id, name)
+            raise NameTaken(name)  # held a moment ago, and already released
         self.db.record(tenant_id, name, "create.requested")
         self.jobs.submit(self._provision, tenant_id, spec, creds)
         return self._view(row, with_players=False), creds.admin_password
+
+    def _refuse_create(self, tenant_id: str, name: str) -> None:
+        """Raise why the row says this create cannot go ahead, if it cannot."""
+        pending = self.db.provisioning_server(tenant_id)
+        if pending is not None:
+            raise CreateInProgress(pending.name)
+        if self.db.count_servers(tenant_id) >= self.settings.max_servers_per_tenant:
+            raise TenantAtCap(tenant_id)
+        if self.db.get_server(name) is not None:
+            raise NameTaken(name)
 
     def _provision(self, tenant_id: str, spec: ReleaseSpec, creds: Credentials) -> None:
         """The cluster steps, off the request thread. Never raises: the outcome
