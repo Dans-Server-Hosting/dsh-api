@@ -322,6 +322,27 @@ def test_another_tenant_sees_nothing(api, alpha, export_jobs) -> None:
     assert api.get(base).status_code == 401
 
 
+def test_another_tenants_start_and_delete_leave_the_exports_untouched(
+    api, alpha, export_jobs, db, tmp_path
+) -> None:
+    export = ready_export(api, export_jobs)
+    files = tmp_path / "exports" / "alpha" / export["id"]
+    assert files.is_dir()
+    before_events = db.events("alpha")
+
+    assert start(api, who=BOB).status_code == 404
+    base = f"/api/v1/servers/alpha/exports/{export['id']}"
+    assert api.delete(base, headers=BOB).status_code == 404
+    assert api.post(f"{base}/link", headers=BOB).status_code == 404
+
+    # Ownership is checked before anything is queued, recorded or removed.
+    assert export_jobs.run() == 0
+    assert [e.id for e in db.all_exports()] == [export["id"]]
+    assert db.events("alpha") == before_events
+    assert files.is_dir()
+    assert api.get(base, headers=ALICE).json()["status"] == "ready"
+
+
 def test_an_export_id_under_another_server_is_404(api, alpha, export_jobs, db) -> None:
     export = ready_export(api, export_jobs)
     db.insert_server("beta", "alice", "beta.play.example.com", "hi", None)

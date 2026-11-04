@@ -319,6 +319,29 @@ def test_another_tenants_server_is_404(alpha, client):
     assert client.post("/api/v1/servers/alpha/plugins/apply", headers=BOB).status_code == 404
 
 
+def test_another_tenants_changes_leave_the_server_untouched(alpha, client, cluster, db):
+    cluster.wrapper_statuses["alpha"] = WrapperStatus(running=True)
+    before_view = plugins(client)
+    before_selection = cluster.selections["alpha"]
+    before_ops = len(cluster.ops)
+    before_commands = len(cluster.commands)
+    before_events = db.events("alpha")
+
+    assert client.put("/api/v1/servers/alpha/plugins/fiefs", headers=BOB).status_code == 404
+    assert client.delete("/api/v1/servers/alpha/plugins/viaversion", headers=BOB).status_code == 404
+    resp = client.post(
+        "/api/v1/servers/alpha/plugins/apply", json={"confirm_players": True}, headers=BOB
+    )
+    assert resp.status_code == 404
+
+    # Ownership is checked before anything is written or restarted.
+    assert cluster.ops[before_ops:] == []
+    assert cluster.selections["alpha"] == before_selection
+    assert cluster.commands[before_commands:] == []
+    assert db.events("alpha") == before_events
+    assert plugins(client) == before_view
+
+
 # --- servers created before selection existed --------------------------------
 
 
