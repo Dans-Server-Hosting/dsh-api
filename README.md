@@ -102,11 +102,12 @@ never fails a list or get.
 | `PATCH` | `/api/v1/feedback/{id}` | `{status: "read"\|"new"}` → the updated item; admin only; 404 for an unknown id |
 
 `POST /api/v1/servers` validates the request, reserves the name and the
-tenant's slot, and answers 202 before any cluster work. The steps then run in
-the background: namespace with quota and limit range, the credentials Secret,
-`helm upgrade --install` without waiting (the profile installs the wrapper
-asleep and the webapp's init container waits for it, so `helm --wait` could
-never finish), one wake, then the wrapper, webapp and nginx rollouts (up to
+tenant's slot (in one SQLite statement, so requests racing for either get the
+same 409 or 403 as a later one would), and answers 202 before any cluster work.
+The steps then run in the background: namespace with quota and limit range,
+the credentials Secret, `helm upgrade --install` without waiting (the profile
+installs the wrapper asleep and the webapp's init container waits for it, so
+`helm --wait` could never finish), one wake, then the wrapper, webapp and nginx rollouts (up to
 `DSH_ROLLOUT_TIMEOUT` each). Poll `GET /api/v1/servers/{name}` until `state`
 leaves `provisioning`; expect a few minutes. The release is installed with
 `minecraftWrapper.env.DEFAULT_PLUGINS` set from `DSH_DEFAULT_PLUGINS`, so a new

@@ -225,6 +225,43 @@ class Database:
             )
         return self.get_server(name)  # type: ignore[return-value]
 
+    def reserve_server(
+        self,
+        name: str,
+        tenant_id: str,
+        hostname: str,
+        motd: str,
+        operator_username: str | None,
+        max_servers: int,
+    ) -> ServerRow | None:
+        """Take the name and one of the tenant's slots with a ``provisioning`` row.
+
+        One statement, so two creates at once cannot both pass: None (and no
+        row) when the name is held, the tenant already has a create in flight,
+        or the tenant has ``max_servers`` servers.
+        """
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO servers (name, tenant_id, hostname, motd,"
+                " operator_username, created_at, status)"
+                " SELECT ?, ?, ?, ?, ?, ?, 'provisioning'"
+                " WHERE NOT EXISTS (SELECT 1 FROM servers"
+                "                   WHERE tenant_id = ? AND status = 'provisioning')"
+                " AND (SELECT COUNT(*) FROM servers WHERE tenant_id = ?) < ?",
+                (
+                    name,
+                    tenant_id,
+                    hostname,
+                    motd,
+                    operator_username,
+                    now_iso(),
+                    tenant_id,
+                    tenant_id,
+                    max_servers,
+                ),
+            )
+        return self.get_server(name) if cur.rowcount == 1 else None
+
     def get_server(self, name: str) -> ServerRow | None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM servers WHERE name = ?", (name,)).fetchone()

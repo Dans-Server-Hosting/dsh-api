@@ -1,6 +1,8 @@
 """Every handler against the fake cluster."""
 
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -186,6 +188,102 @@ def test_second_create_while_provisioning_is_409_not_the_cap(client, cluster, jo
     resp = client.post("/api/v1/servers", json={"name": "second"}, headers=ALICE)
     assert resp.status_code == 403
     assert "cap" in resp.json()["detail"]
+
+
+def _other_request_lands_during_the_lookup(monkeypatch, resolver, db, *server, status):
+    """The Mojang lookup sits between ``create``'s checks and its insert; another
+    request's row appears there, after the checks have passed."""
+    resolve = resolver.resolve
+
+    def resolve_and_lose_the_race(username: str) -> str:
+        name, tenant = server
+        db.insert_server(name, tenant, f"{name}.play.example.com", "m", None, status=status)
+        return resolve(username)
+
+    monkeypatch.setattr(resolver, "resolve", resolve_and_lose_the_race)
+
+
+def _create_with_operator(client, name):
+    return client.post(
+        "/api/v1/servers", json={"name": name, "operator_username": "Steve"}, headers=ALICE
+    )
+
+
+def test_a_name_taken_during_the_lookup_is_409(client, db, jobs, resolver, monkeypatch):
+    _other_request_lands_during_the_lookup(
+        monkeypatch, resolver, db, "alpha", "bob", status="provisioning"
+    )
+    resp = _create_with_operator(client, "alpha")
+    assert resp.status_code == 409, resp.text
+    assert "taken" in resp.json()["detail"]
+    assert db.get_server("alpha").tenant_id == "bob"
+    assert jobs.pending == []
+    assert db.events("alpha") == []
+
+
+def test_a_create_that_starts_during_the_lookup_is_409(client, db, jobs, resolver, monkeypatch):
+    # A double-submitted form: the slot's one server must not become two.
+    _other_request_lands_during_the_lookup(
+        monkeypatch, resolver, db, "first", "alice", status="provisioning"
+    )
+    resp = _create_with_operator(client, "second")
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["server"] == "first"
+    assert db.get_server("second") is None
+    assert db.count_servers("alice") == 1
+    assert jobs.pending == []
+
+
+def test_the_last_slot_taken_during_the_lookup_is_403(client, db, jobs, resolver, monkeypatch):
+    _other_request_lands_during_the_lookup(
+        monkeypatch, resolver, db, "first", "alice", status="ready"
+    )
+    resp = _create_with_operator(client, "second")
+    assert resp.status_code == 403, resp.text
+    assert "cap" in resp.json()["detail"]
+    assert db.get_server("second") is None
+    assert db.count_servers("alice") == 1
+    assert jobs.pending == []
+
+
+def test_a_lost_reservation_is_refused_once_the_winner_has_gone(client, db, jobs, monkeypatch):
+    # The row that took the name can be deleted before the recheck looks for it.
+    monkeypatch.setattr(db, "reserve_server", lambda *args: None)
+    resp = client.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE)
+    assert resp.status_code == 409, resp.text
+    assert db.get_server("alpha") is None
+    assert jobs.pending == []
+
+
+def test_one_of_many_concurrent_reservations_wins(db):
+    db.ensure_tenant("alice")
+    start = threading.Barrier(8)
+
+    def reserve(i: int) -> bool:
+        start.wait()
+        row = db.reserve_server(f"s{i}", "alice", f"s{i}.play.example.com", "m", None, 2)
+        return row is not None
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        won = list(pool.map(reserve, range(8)))
+
+    # Each reservation is in flight until its job ends, so one wins outright.
+    assert won.count(True) == 1
+    assert db.count_servers("alice") == 1
+
+
+def test_reserve_server_counts_up_to_the_cap_and_no_further(db):
+    def reserve(name: str, tenant: str = "alice"):
+        return db.reserve_server(name, tenant, f"{name}.play.example.com", "m", None, 2)
+
+    assert reserve("one").status == "provisioning"
+    assert reserve("two") is None  # "one" is still in flight
+    db.set_status("one", "ready")
+    assert reserve("one") is None  # the name is held
+    assert reserve("two").status == "provisioning"
+    db.set_status("two", "ready")
+    assert reserve("three") is None  # at the cap of two
+    assert reserve("three", "bob").tenant_id == "bob"  # the cap is per tenant
 
 
 def test_wake_and_delete_while_provisioning(client, cluster, jobs):
