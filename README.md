@@ -178,7 +178,7 @@ OMCSI checkout at `OMCSI_CHART_DIR` (the image provides all three).
 | `DSH_EXPORT_DIR` | `/exports` | where finished exports are kept (`<server>/<id>/`) |
 | `DSH_EXPORT_DEFAULT_SIZE` | `256` | blocks a side of the default box around spawn |
 | `DSH_EXPORT_MAX_SIZE` | `512` | the largest box a side |
-| `DSH_EXPORT_DAILY_LIMIT` | `5` | exports per account per rolling 24 hours |
+| `DSH_EXPORT_DAILY_LIMIT` | `5` | exports per account per rolling 24 hours; deleting an export, or its server, does not give its slot back |
 | `DSH_EXPORT_RETENTION_HOURS` | `72` | how long a finished export is kept |
 | `DSH_EXPORT_TIMEOUT_SECONDS` | `600` | the API stops a run after this; the pod's own deadline is 900 s |
 | `DSH_EXPORT_LINK_SECRET` | *(derived from the JWT secret)* | key for signed download links |
@@ -262,9 +262,12 @@ on:
 Off until `DSH_WORLD_EXPORT=true`; every route answers 503 until then, which
 the portal takes as "hide the section". While it is on:
 
-- `POST .../exports` checks ownership, the server's state, one export per
-  server and the daily limit, records the export `queued` and answers. Exports
-  run **one at a time on the whole node** on their own one-worker executor.
+- `POST .../exports` checks ownership and the server's state, records the
+  export `queued` and answers; one export per server and the daily limit are
+  decided in the same SQLite transaction as that record, so requests racing for
+  either get the same 409 or 429 as a later one would. The limit counts the
+  `export.requested` events, which outlive the export. Exports run **one at a
+  time on the whole node** on their own one-worker executor.
 - A run applies `NetworkPolicy/dsh-export-isolate` (deny all, export pods
   only) in `t-<name>`, then creates `pod/world-export-<id>`: the export image,
   the world PVC mounted **read-only**, no service-account token, read-only
@@ -280,7 +283,9 @@ the portal takes as "hide the section". While it is on:
   `preview/<usd-web file>`, then moved to `DSH_EXPORT_DIR/<server>/<id>/`.
 - Finished and failed exports are removed after `DSH_EXPORT_RETENTION_HOURS`,
   and with their server; a restart marks running ones failed and deletes their
-  pods.
+  pods. An export past its `expires_at` is gone at once (left out of the list,
+  404 everywhere, links included); its files are swept at startup and, at most
+  every 10 minutes, when exports are listed or started.
 
 ## World export image
 
