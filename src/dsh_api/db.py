@@ -90,6 +90,9 @@ ROW_STATUSES = ("provisioning", "ready", "failed", "deleting")
 state from here on), or failed (the row keeps the tenant's slot until DELETE);
 or that a DELETE was accepted and its steps are still running."""
 
+EXPORT_REQUESTED = "export.requested"
+"""The event of an accepted export; what the daily limit counts."""
+
 
 def now_iso() -> str:
     return _iso(datetime.now(UTC))
@@ -407,11 +410,16 @@ class Database:
 
     def record(self, tenant_id: str, server_name: str | None, kind: str, detail: str = "") -> None:
         with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO events (at, tenant_id, server_name, kind, detail)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (now_iso(), tenant_id, server_name, kind, detail),
-            )
+            self._insert_event(conn, tenant_id, server_name, kind, detail)
+
+    @staticmethod
+    def _insert_event(
+        conn: sqlite3.Connection, tenant_id: str, server_name: str | None, kind: str, detail: str
+    ) -> None:
+        conn.execute(
+            "INSERT INTO events (at, tenant_id, server_name, kind, detail) VALUES (?, ?, ?, ?, ?)",
+            (now_iso(), tenant_id, server_name, kind, detail),
+        )
 
     def events(self, server_name: str) -> list[dict]:
         with self._connect() as conn:
@@ -478,6 +486,55 @@ class Database:
         assert row is not None
         return row
 
+    def reserve_export(
+        self,
+        export_id: str,
+        server: str,
+        tenant_id: str,
+        area: tuple[int, int, int, int] | None,
+        daily_limit: int,
+        window: timedelta,
+    ) -> ExportRow | None:
+        """Record a ``queued`` export and the event that counts it, together.
+
+        One transaction, so two starts at once cannot both pass: None (and
+        nothing written) when an export of the server is queued or running, or
+        the tenant has started ``daily_limit`` exports within ``window``.
+        """
+        x1, z1, x2, z2 = area if area else (None, None, None, None)
+        since = _iso(datetime.now(UTC) - window)
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO world_exports (id, server, tenant_id, status, x1, z1, x2, z2,"
+                " custom_area, created_at)"
+                " SELECT ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?"
+                " WHERE NOT EXISTS (SELECT 1 FROM world_exports WHERE server = ?"
+                "                   AND tenant_id = ? AND status IN ('queued', 'running'))"
+                " AND (SELECT COUNT(*) FROM events WHERE tenant_id = ?"
+                "      AND kind = ? AND at > ?) < ?",
+                (
+                    export_id,
+                    server,
+                    tenant_id,
+                    x1,
+                    z1,
+                    x2,
+                    z2,
+                    int(area is not None),
+                    now_iso(),
+                    server,
+                    tenant_id,
+                    tenant_id,
+                    EXPORT_REQUESTED,
+                    since,
+                    daily_limit,
+                ),
+            )
+            if cur.rowcount != 1:
+                return None
+            self._insert_event(conn, tenant_id, server, EXPORT_REQUESTED, export_id)
+        return self.get_export(export_id)
+
     def get_export(self, export_id: str) -> ExportRow | None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM world_exports WHERE id = ?", (export_id,)).fetchone()
@@ -507,13 +564,16 @@ class Database:
 
     def count_exports_since(self, tenant_id: str, window: timedelta) -> tuple[int, str | None]:
         """How many exports the tenant started within ``window``, and the oldest
-        of those start times (when the next one frees up)."""
+        of those start times (when the next one frees up).
+
+        Read from the events, which outlive the export: deleting an export, or
+        its server, does not hand back what it used."""
         since = _iso(datetime.now(UTC) - window)
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM world_exports"
-                " WHERE tenant_id = ? AND created_at > ?",
-                (tenant_id, since),
+                "SELECT COUNT(*) AS n, MIN(at) AS oldest FROM events"
+                " WHERE tenant_id = ? AND kind = ? AND at > ?",
+                (tenant_id, EXPORT_REQUESTED, since),
             ).fetchone()
         return int(row["n"]), row["oldest"]
 

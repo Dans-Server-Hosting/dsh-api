@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import io
 import json
+import sqlite3
 import tarfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -250,6 +252,122 @@ def test_the_daily_limit_is_429_with_retry_after(make_app, alpha, export_jobs) -
     assert resp.headers["Retry-After"] == str(resp.json()["retry_after"])
 
 
+def test_deleting_an_export_does_not_give_its_daily_slot_back(make_app, alpha, export_jobs) -> None:
+    api = make_app(export_daily_limit=2)
+    for _ in range(2):
+        export = ready_export(api, export_jobs)
+        resp = api.delete(f"/api/v1/servers/alpha/exports/{export['id']}", headers=ALICE)
+        assert resp.status_code == 204
+    resp = start(api)
+    assert resp.status_code == 429
+    assert 0 < resp.json()["retry_after"] <= 24 * 3600
+    assert export_jobs.pending == []
+
+
+def test_deleting_the_server_does_not_give_its_daily_slots_back(
+    make_app, alpha, export_jobs, jobs
+) -> None:
+    api = make_app(export_daily_limit=1)
+    ready_export(api, export_jobs)
+    assert api.delete("/api/v1/servers/alpha", headers=ALICE).status_code == 202
+    jobs.run()
+    assert api.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE).status_code == 202
+    jobs.run()
+    assert start(api).status_code == 429
+
+
+def test_the_daily_limit_counts_only_the_last_day_and_only_the_caller(
+    make_app, alpha, export_jobs, db
+) -> None:
+    api = make_app(export_daily_limit=1)
+    ready_export(api, export_jobs)
+    # Another tenant's export does not use up alice's day, whatever it is.
+    db.record("bob", "beta", "export.requested", "0000aaaa1111")
+    assert start(api).status_code == 429
+    # An old start has aged out of the rolling window.
+    yesterday = datetime.now(UTC) - timedelta(hours=25)
+    stamp = yesterday.isoformat().replace("+00:00", "Z")
+    with sqlite3.connect(db.path) as conn:
+        conn.execute("UPDATE events SET at = ?", (stamp,))
+    assert start(api).status_code == 202
+
+
+def test_an_export_slot_lost_to_a_concurrent_start_is_refused(
+    make_app, alpha, export_jobs, db, monkeypatch
+) -> None:
+    api = make_app()
+    real = db.count_exports_since
+
+    def other_request_wins(tenant_id, window):
+        answer = real(tenant_id, window)
+        db.insert_export("0000aaaa1111", "alpha", "alice", None)
+        return answer
+
+    monkeypatch.setattr(db, "count_exports_since", other_request_wins)
+    resp = start(api)
+    monkeypatch.undo()
+    assert resp.status_code == 409
+    assert "already running" in resp.json()["detail"]
+    assert export_jobs.pending == []
+    assert [e.id for e in db.all_exports()] == ["0000aaaa1111"]
+
+
+def test_a_daily_slot_lost_to_a_concurrent_start_is_429(
+    make_app, alpha, export_jobs, db, monkeypatch
+) -> None:
+    api = make_app(export_daily_limit=1)
+    real = db.count_exports_since
+    calls = []
+
+    def other_request_wins(tenant_id, window):
+        answer = real(tenant_id, window)
+        if not calls:  # after the first check, before the reservation
+            db.record("alice", "alpha", "export.requested", "0000aaaa1111")
+        calls.append(tenant_id)
+        return answer
+
+    monkeypatch.setattr(db, "count_exports_since", other_request_wins)
+    resp = start(api)
+    monkeypatch.undo()
+    assert resp.status_code == 429
+    assert export_jobs.pending == [] and db.all_exports() == []
+
+
+def test_a_reservation_lost_to_an_export_already_finished_is_refused(
+    api, alpha, export_jobs, db, monkeypatch
+) -> None:
+    monkeypatch.setattr(db, "reserve_export", lambda *a: None)
+    resp = start(api)
+    monkeypatch.undo()
+    assert resp.status_code == 409
+    assert "already running" in resp.json()["detail"]
+    assert export_jobs.pending == []
+
+
+@pytest.mark.parametrize(
+    ("servers", "limit", "winners"),
+    [(["alpha"] * 8, 100, 1), ([f"s{i}" for i in range(8)], 3, 3)],
+    ids=["one-per-server", "daily-limit"],
+)
+def test_threads_racing_for_a_reservation_cannot_all_win(db, servers, limit, winners) -> None:
+    def reserve(i: int):
+        return db.reserve_export(f"{i:012x}", servers[i], "alice", None, limit, timedelta(hours=24))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(reserve, range(8)))
+    assert sum(r is not None for r in results) == winners
+    assert len(db.all_exports()) == winners
+    assert db.count_exports_since("alice", timedelta(hours=24))[0] == winners
+
+
+def test_an_accepted_export_is_recorded_once(api, alpha, export_jobs, db) -> None:
+    export_id = start(api, {"area": {"x1": 0, "z1": 0, "x2": 15, "z2": 15}}).json()["id"]
+    requested = [e["detail"] for e in db.events("alpha") if e["kind"] == "export.requested"]
+    assert requested == [export_id]
+    row = db.get_export(export_id)
+    assert row.status == "queued" and row.custom_area and (row.x2, row.z2) == (15, 15)
+
+
 def test_not_while_the_server_is_being_created_or_failing(api, jobs, cluster, export_jobs):
     assert api.post("/api/v1/servers", json={"name": "alpha"}, headers=ALICE).status_code == 202
     resp = start(api)
@@ -472,6 +590,37 @@ def test_expired_and_orphaned_exports_are_swept(api, alpha, export_jobs, db, tmp
     assert not (tmp_path / "exports" / "alpha" / old["id"]).exists()
     assert not stray.exists()
     assert (tmp_path / "exports" / "alpha" / keep["id"] / "world.zip").is_file()
+
+
+def expire(db, export_id: str) -> None:
+    past = (datetime.now(UTC) - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+    db.update_export(export_id, expires_at=past)
+
+
+def test_an_expired_export_is_gone_before_any_sweep(api, alpha, export_jobs, db) -> None:
+    export = ready_export(api, export_jobs)
+    base = f"/api/v1/servers/alpha/exports/{export['id']}"
+    link = api.post(f"{base}/link", headers=ALICE).json()
+    path = link["url"].removeprefix("https://api.example.com")
+    assert api.get("/api/v1/servers/alpha/exports", headers=ALICE).json()["exports"]
+
+    expire(db, export["id"])  # and the sweep that starting it ran is not due again yet
+
+    assert api.get("/api/v1/servers/alpha/exports", headers=ALICE).json() == {"exports": []}
+    assert api.get(base, headers=ALICE).status_code == 404
+    assert api.get(f"{base}/preview/index.json", headers=ALICE).status_code == 404
+    assert api.post(f"{base}/link", headers=ALICE).status_code == 404
+    assert api.get(path).status_code == 404  # a link minted before it expired
+    assert api.delete(base, headers=ALICE).status_code == 404
+
+
+def test_a_new_export_sweeps_when_due(api, alpha, export_jobs, db, tmp_path) -> None:
+    old = ready_export(api, export_jobs)
+    expire(db, old["id"])
+    api.app.state.exports._last_sweep = None  # starting ``old`` swept; the next is due
+    assert start(api).status_code == 202
+    assert db.get_export(old["id"]) is None
+    assert not (tmp_path / "exports" / "alpha" / old["id"]).exists()
 
 
 def test_a_restart_fails_interrupted_exports_and_removes_their_pods(make_app, alpha, cluster):

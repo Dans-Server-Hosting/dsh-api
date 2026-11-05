@@ -34,6 +34,7 @@ LINK_TTL = timedelta(minutes=15)
 DAY = timedelta(hours=24)
 COORDINATE_LIMIT = 29_999_984  # the world border
 SWEEP_EVERY = timedelta(minutes=10)
+ALREADY_RUNNING = "an export of this server is already running"
 
 
 class ExportDisabled(Exception):
@@ -97,6 +98,10 @@ def _parse_iso(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def _expired(row: ExportRow, now: datetime) -> bool:
+    return row.expires_at is not None and _parse_iso(row.expires_at) <= now
+
+
 def _b64(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
@@ -138,6 +143,8 @@ class ExportService:
         row = self.db.get_export(export_id) if EXPORT_ID_RE.match(export_id) else None
         if row is None or row.server != name or row.tenant_id != tenant_id:
             raise ExportNotFound(export_id)
+        if _expired(row, datetime.now(UTC)):  # the sweep has just not got to it yet
+            raise ExportNotFound(export_id)
         return row
 
     def validate_area(self, x1: int, z1: int, x2: int, z2: int) -> tuple[int, int, int, int]:
@@ -157,7 +164,9 @@ class ExportService:
         self._require_enabled()
         self.servers.owned(tenant_id, name)
         self.sweep_if_due()
-        return [asdict(_view(r)) for r in self.db.list_exports(name, tenant_id)]
+        now = datetime.now(UTC)
+        rows = self.db.list_exports(name, tenant_id)
+        return [asdict(_view(r)) for r in rows if not _expired(r, now)]
 
     def get(self, tenant_id: str, name: str, export_id: str) -> dict:
         self._require_enabled()
@@ -178,24 +187,34 @@ class ExportService:
     def create(self, tenant_id: str, name: str, area: tuple[int, int, int, int] | None) -> dict:
         self._require_enabled()
         row = self.servers.owned(tenant_id, name)
+        self.sweep_if_due()  # the one route that adds files
         if area is not None:
             area = self.validate_area(*area)
         if row.status != "ready":
             raise ExportConflict(f"the server is {row.status}; try again once it is up")
         if self.servers.state_of(name) == "failed":
             raise ExportConflict("the server is failing; it cannot be exported until it is fixed")
+        self._refuse_export(tenant_id, name)
+        # The reservation is what decides between requests that both passed.
+        export_id = secrets.token_hex(6)
+        export = self.db.reserve_export(
+            export_id, name, tenant_id, area, self.settings.export_daily_limit, DAY
+        )
+        if export is None:
+            self._refuse_export(tenant_id, name)
+            raise ExportConflict(ALREADY_RUNNING)  # held a moment ago, and already finished
+        self.jobs.submit(self._run, export_id)
+        return asdict(_view(export))
+
+    def _refuse_export(self, tenant_id: str, name: str) -> None:
+        """Raise why the rows say this export cannot start, if it cannot."""
         if any(e.status in ACTIVE for e in self.db.list_exports(name, tenant_id)):
-            raise ExportConflict("an export of this server is already running")
+            raise ExportConflict(ALREADY_RUNNING)
         count, oldest = self.db.count_exports_since(tenant_id, DAY)
         if count >= self.settings.export_daily_limit:
             frees_at = _parse_iso(oldest) + DAY if oldest else datetime.now(UTC) + DAY
             retry = max(1, int((frees_at - datetime.now(UTC)).total_seconds()))
             raise ExportLimit(self.settings.export_daily_limit, retry)
-        export_id = secrets.token_hex(6)
-        export = self.db.insert_export(export_id, name, tenant_id, area)
-        self.db.record(tenant_id, name, "export.requested", export_id)
-        self.jobs.submit(self._run, export_id)
-        return asdict(_view(export))
 
     def delete(self, tenant_id: str, name: str, export_id: str) -> None:
         self._require_enabled()
@@ -240,6 +259,8 @@ class ExportService:
             raise ExportNotFound("link")
         row = self.db.get_export(export_id) if EXPORT_ID_RE.match(export_id) else None
         if row is None or row.server != server or row.status != "ready":
+            raise ExportNotFound("link")
+        if _expired(row, datetime.now(UTC)):
             raise ExportNotFound("link")
         path = self._dir(row.server, row.id) / "world.zip"
         if not path.is_file():
@@ -362,9 +383,8 @@ class ExportService:
         known: set[tuple[str, str]] = set()
         for row in self.db.all_exports():
             server = self.db.get_server(row.server)
-            expired = row.expires_at is not None and _parse_iso(row.expires_at) <= now
             orphaned = server is None or server.tenant_id != row.tenant_id
-            if row.status not in ACTIVE and (expired or orphaned):
+            if row.status not in ACTIVE and (_expired(row, now) or orphaned):
                 self._remove(row.server, row.id)
                 removed += 1
             else:
