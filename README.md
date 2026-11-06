@@ -80,7 +80,7 @@ never fails a list or get.
 | `GET` | `/api/v1/limits` | free-tier profile as numbers, plus the world-export limits (`export_default_size`, `export_max_size`, `export_daily_limit`, `export_retention_hours`); no token needed |
 | `GET` | `/api/v1/default-plugins` | the plugins every new server is installed with, in install order (`name`, `version`, `description`, `download_url`, `project_url`); no token needed |
 | `GET` | `/api/v1/servers` | the caller's servers |
-| `POST` | `/api/v1/servers` | `{name, motd?, operator_username?}` → **202** with the server in state `provisioning`; the admin password is in this response **only**. 409 `{"detail": "a server is already being created for this account", "server": "<name>"}` while the caller's earlier create is still running; 409 when the name is taken; 403 at the tenant cap |
+| `POST` | `/api/v1/servers` | `{name, motd?, operator_username?}` → **202** with the server in state `provisioning`; the admin password is in this response **only**. `name` is 2–31 lowercase letters, digits and dashes, starting with a letter and not ending in a dash, and may not contain `omcsi` (422 otherwise). 409 `{"detail": "a server is already being created for this account", "server": "<name>"}` while the caller's earlier create is still running; 409 when the name is taken; 403 at the tenant cap; 422 when `operator_username` cannot be resolved, including when Mojang cannot be reached |
 | `GET` | `/api/v1/servers/{name}` | one server, with `players_online` when `awake` (`null` otherwise) |
 | `POST` | `/api/v1/servers/{name}/wake` | 202 with the resulting server: `asleep` → scales the wrapper to 1; `stopped` → `POST /api/server/start` on the wrapper; `waking`/`awake`/`failed` → no-op (a failed server, including one whose StatefulSet is gone, is reported as such rather than scaled) |
 | `DELETE` | `/api/v1/servers/{name}` | **202** with the server in state `deleting`; backup, `helm uninstall` and namespace delete then run in the background, and `GET` answers 404 once they are done. 409 while players are online unless `?force=true`; 409 while the server is still `provisioning`; a `failed` create is removed even when there is nothing to back up; a retry after a delete that failed past its backup reuses that backup when the world volume is already gone |
@@ -97,7 +97,7 @@ never fails a list or get.
 | `GET` | `/api/v1/export-downloads/{token}` | **no token needed**: the signed link is the credential; the zip as `<server>-world-<id>.zip`. 404 for a bad, expired or deleted link |
 | `DELETE` | `/api/v1/servers/{name}/exports/{id}` | 204; 409 while it is queued/running |
 | `GET` | `/api/v1/me` | `{username, is_admin}` for the caller; admins are the `DSH_ADMIN_USERS` logins |
-| `POST` | `/api/v1/feedback` | `{message (1–4000 chars), page?}` → 201; any signed-in user, at most 10 per user per hour (429) |
+| `POST` | `/api/v1/feedback` | `{message (1–4000 chars), page?}` → 201; any signed-in user, at most 10 per user per hour (429, decided in the SQLite statement that stores the message, so concurrent submissions cannot pass it) |
 | `GET` | `/api/v1/feedback?status=new\|read\|all` | admin only (403 otherwise); newest first, default `new` |
 | `PATCH` | `/api/v1/feedback/{id}` | `{status: "read"\|"new"}` → the updated item; admin only; 404 for an unknown id |
 

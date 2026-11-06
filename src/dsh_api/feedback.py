@@ -27,9 +27,9 @@ class FeedbackService:
         self.db = db
 
     def submit(self, username: str, message: str, page: str | None) -> FeedbackRow:
-        if self.db.count_feedback_since(username, RATE_WINDOW) >= RATE_LIMIT:
+        row = self.db.reserve_feedback(username, message, page, RATE_LIMIT, RATE_WINDOW)
+        if row is None:
             raise FeedbackRateLimited(RATE_LIMIT, RATE_WINDOW)
-        row = self.db.insert_feedback(username, message, page)
         self.db.record(username, None, "feedback", str(row.id))
         return row
 

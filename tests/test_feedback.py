@@ -1,10 +1,12 @@
 """Feedback and /me, against the fake validator: ``admin`` is the one admin."""
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from threading import Barrier
 
 import pytest
 
-from dsh_api.feedback import RATE_LIMIT
+from dsh_api.feedback import RATE_LIMIT, FeedbackRateLimited, FeedbackService
 
 ALICE = {"Authorization": "Bearer alice-token"}
 BOB = {"Authorization": "Bearer bob-token"}
@@ -99,6 +101,38 @@ def test_submit_is_rate_limited_per_user(client, db):
     assert submit(client, ALICE).status_code == 201
 
 
+def test_threads_racing_past_the_rate_limit_cannot_all_win(db):
+    service = FeedbackService(db)
+    for _ in range(RATE_LIMIT - 2):
+        service.submit("alice", "earlier", None)
+    start = Barrier(8)
+
+    def submit_at_once(_: int) -> bool:
+        start.wait()
+        try:
+            service.submit("alice", "raced", None)
+        except FeedbackRateLimited:
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(submit_at_once, range(8)))
+    assert sum(results) == 2
+    assert db.count_feedback_since("alice", timedelta(hours=1)) == RATE_LIMIT
+
+
+def test_a_refused_submission_writes_nothing(db):
+    service = FeedbackService(db)
+    for _ in range(RATE_LIMIT):
+        service.submit("alice", "earlier", None)
+    with pytest.raises(FeedbackRateLimited):
+        service.submit("alice", "one too many", None)
+    assert [row.message for row in db.list_feedback()] == ["earlier"] * RATE_LIMIT
+    with db._connect() as conn:
+        (events,) = conn.execute("SELECT COUNT(*) FROM events").fetchone()
+    assert events == RATE_LIMIT
+
+
 # --- list ------------------------------------------------------------------
 
 
@@ -181,6 +215,6 @@ def test_existing_databases_gain_the_feedback_table(tmp_path):
         conn.execute("CREATE TABLE tenants (id TEXT PRIMARY KEY, created_at TEXT NOT NULL)")
         conn.execute("INSERT INTO tenants VALUES ('alice', '2026-01-01T00:00:00Z')")
     db = Database(str(path))
-    assert db.insert_feedback("alice", "still here", None).id == 1
+    assert db.reserve_feedback("alice", "still here", None, 1, timedelta(hours=1)).id == 1
     with db._connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM tenants").fetchone()[0] == 1

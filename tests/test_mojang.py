@@ -1,3 +1,4 @@
+import http.client
 import io
 import json
 import urllib.error
@@ -90,6 +91,34 @@ def test_mojang_resolver_malformed_json_is_unknown(monkeypatch):
 def test_mojang_resolver_answer_without_an_id_is_unknown(monkeypatch, body):
     monkeypatch.setattr(
         "urllib.request.urlopen", lambda url, timeout: Response(json.dumps(body).encode())
+    )
+    with pytest.raises(UnknownUsername, match="^Steve$"):
+        MojangResolver().resolve("Steve")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        http.client.RemoteDisconnected("closed without a response"),
+        ConnectionResetError("reset by peer"),
+        http.client.IncompleteRead(b"{"),
+    ],
+    ids=["remote-disconnected", "connection-reset", "incomplete-read"],
+)
+def test_mojang_resolver_connection_dropped_mid_answer_is_unknown(monkeypatch, error):
+    def urlopen(url, timeout):
+        raise error
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    with pytest.raises(UnknownUsername, match="could not be reached"):
+        MojangResolver().resolve("Steve")
+
+
+@pytest.mark.parametrize("raw", ["not-a-uuid", 5, ["8667ba71b85a4004af54457a9734eed7"]])
+def test_mojang_resolver_malformed_id_is_unknown(monkeypatch, raw):
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda url, timeout: Response(json.dumps({"id": raw}).encode()),
     )
     with pytest.raises(UnknownUsername, match="^Steve$"):
         MojangResolver().resolve("Steve")

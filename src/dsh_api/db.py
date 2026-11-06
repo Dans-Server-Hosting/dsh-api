@@ -431,14 +431,25 @@ class Database:
 
     # --- feedback ----------------------------------------------------------
 
-    def insert_feedback(self, username: str, message: str, page: str | None) -> FeedbackRow:
+    def reserve_feedback(
+        self, username: str, message: str, page: str | None, limit: int, window: timedelta
+    ) -> FeedbackRow | None:
+        """Store a message unless ``username`` has left ``limit`` within ``window``.
+
+        One statement, so concurrent submissions cannot all pass: None (and no
+        row) when the limit is reached.
+        """
+        since = _iso(datetime.now(UTC) - window)
         with self._connect() as conn:
             cur = conn.execute(
-                "INSERT INTO feedback (username, message, page, created_at) VALUES (?, ?, ?, ?)",
-                (username, message, page, now_iso()),
+                "INSERT INTO feedback (username, message, page, created_at)"
+                " SELECT ?, ?, ?, ?"
+                " WHERE (SELECT COUNT(*) FROM feedback"
+                "        WHERE username = ? AND created_at >= ?) < ?",
+                (username, message, page, now_iso(), username, since, limit),
             )
-            feedback_id = cur.lastrowid
-        return self.get_feedback(feedback_id)  # type: ignore[arg-type,return-value]
+            feedback_id = cur.lastrowid if cur.rowcount == 1 else None
+        return self.get_feedback(feedback_id) if feedback_id is not None else None
 
     def get_feedback(self, feedback_id: int) -> FeedbackRow | None:
         with self._connect() as conn:
