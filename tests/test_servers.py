@@ -108,12 +108,32 @@ def test_create_with_unknown_operator_is_422_and_provisions_nothing(client, clus
 
 @pytest.mark.parametrize(
     "name",
-    ["A", "Alpha", "1abc", "a", "has_underscore", "my-omcsi", "omcsi", "a" * 32, "ünï", "alpha\n"],
+    [
+        "A",
+        "Alpha",
+        "1abc",
+        "a",
+        "has_underscore",
+        "my-omcsi",
+        "omcsi",
+        "a" * 32,
+        "ünï",
+        "alpha\n",
+        "alpha-",
+        "a-",
+        "a" * 30 + "-",
+    ],
 )
 def test_create_rejects_bad_names(client, cluster, name):
     resp = client.post("/api/v1/servers", json={"name": name}, headers=ALICE)
     assert resp.status_code == 422, resp.text
     assert cluster.ops == []
+
+
+@pytest.mark.parametrize("name", ["ab", "a1", "a-b", "a" * 31, "a" * 29 + "-b"])
+def test_create_accepts_names_at_the_edges_of_the_pattern(client, name):
+    resp = client.post("/api/v1/servers", json={"name": name}, headers=ALICE)
+    assert resp.status_code == 202, resp.text
 
 
 def test_create_same_name_twice_is_409(client, settings, created):

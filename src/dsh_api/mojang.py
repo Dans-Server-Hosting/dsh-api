@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -33,12 +34,17 @@ class MojangResolver:
             if exc.code == 404:
                 raise UnknownUsername(username) from None
             raise UnknownUsername(f"{username}: Mojang returned HTTP {exc.code}") from exc
-        except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            # OSError takes in URLError and TimeoutError, and the resets urllib
+            # lets through unwrapped once the request has been sent.
             raise UnknownUsername(f"{username}: Mojang could not be reached ({exc})") from exc
         raw = body.get("id") if isinstance(body, dict) else None
         if not raw:
             raise UnknownUsername(username)
-        return str(uuid.UUID(raw))
+        try:
+            return str(uuid.UUID(str(raw)))
+        except ValueError:
+            raise UnknownUsername(username) from None
 
 
 class FakeResolver:

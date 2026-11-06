@@ -25,7 +25,9 @@ from dsh_api.selection import default_selection, selection_json, selection_sha25
 
 log = logging.getLogger(__name__)
 
-NAME_PATTERN = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
+# The name is a label in the namespace t-<name> and in the hostnames, and a
+# label cannot end in a dash.
+NAME_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,29}[a-z0-9]$")
 
 STATES = ("provisioning", "asleep", "waking", "awake", "stopped", "failed", "deleting")
 
@@ -61,7 +63,10 @@ def server_state(
 
 def validate_name(name: str) -> str:
     if not NAME_PATTERN.fullmatch(name):
-        raise ValueError("name must be lowercase letters, digits and dashes, 2-31 characters")
+        raise ValueError(
+            "name must be lowercase letters, digits and dashes, 2-31 characters,"
+            " starting with a letter and not ending in a dash"
+        )
     if "omcsi" in name:
         raise ValueError("name must not contain 'omcsi'")
     return name
