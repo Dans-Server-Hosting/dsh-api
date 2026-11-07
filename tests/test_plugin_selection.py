@@ -2,6 +2,9 @@
 wrapper reconciles at boot, and applying a change."""
 
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
 import pytest
@@ -9,9 +12,10 @@ from fastapi.testclient import TestClient
 
 from dsh_api.auth import FakeValidator
 from dsh_api.catalog import CatalogPlugin, FakeCatalog, extras_from_defaults
-from dsh_api.cluster import WrapperStatus
+from dsh_api.cluster import ClusterError, WrapperStatus
 from dsh_api.config import DEFAULT_PLUGINS, split_csv
 from dsh_api.main import create_app
+from dsh_api.selection import selection_sha256
 
 ALICE = {"Authorization": "Bearer alice-token"}
 BOB = {"Authorization": "Bearer bob-token"}
@@ -239,6 +243,111 @@ def test_a_default_plugin_can_be_removed(alpha, client, cluster):
     resp = client.delete("/api/v1/servers/alpha/plugins/dans-plugin-manager", headers=ALICE)
     assert resp.status_code == 200
     assert "dans-plugin-manager" not in selection(cluster)
+
+
+# --- changes at once ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "first, second",
+    [
+        (("put", "fiefs"), ("put", "currencies")),
+        (("put", "fiefs"), ("delete", "viabackwards")),
+    ],
+)
+def test_concurrent_changes_leave_the_configmap_and_rows_agreeing(
+    alpha, client, cluster, db, monkeypatch, first, second
+):
+    # Unserialized, both changes have read the rows when they meet here, and
+    # each goes on to write a list without the other's change.
+    both_read = threading.Barrier(2, timeout=0.5)
+    real_write = cluster.write_plugin_selection
+
+    def write(name, text):
+        try:
+            both_read.wait()
+        except threading.BrokenBarrierError:
+            pass
+        real_write(name, text)
+
+    monkeypatch.setattr(cluster, "write_plugin_selection", write)
+
+    def change(request):
+        method, slug = request
+        return client.request(method, f"/api/v1/servers/alpha/plugins/{slug}", headers=ALICE)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(change, [first, second]))
+
+    assert [r.status_code for r in responses] == [200, 200]
+    slugs = {r.slug for r in db.selected_plugins("alpha")}
+    assert "fiefs" in slugs
+    assert set(selection(cluster)) == slugs
+    state = db.plugin_state("alpha")
+    assert state.written_sha256 == selection_sha256(cluster.selections["alpha"])
+
+
+def test_a_change_that_waited_is_refused_once_the_server_is_being_deleted(
+    alpha, client, cluster, db, monkeypatch
+):
+    writing, finish = threading.Event(), threading.Event()
+    real_write = cluster.write_plugin_selection
+
+    def write(name, text):
+        writing.set()
+        assert finish.wait(5)
+        real_write(name, text)
+
+    monkeypatch.setattr(cluster, "write_plugin_selection", write)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pool.submit(client.put, "/api/v1/servers/alpha/plugins/fiefs", headers=ALICE)
+        assert writing.wait(5)
+        waited = pool.submit(client.put, "/api/v1/servers/alpha/plugins/currencies", headers=ALICE)
+        time.sleep(0.2)  # long enough to be held at the lock
+        db.set_status("alpha", "deleting")
+        finish.set()
+
+    assert waited.result().status_code == 409
+    assert "currencies" not in selection(cluster)
+
+
+def test_a_refused_change_does_not_hold_the_server_up(alpha, client, cluster, monkeypatch):
+    monkeypatch.setattr("dsh_api.plugin_service.CHANGE_WAIT_SECONDS", 0.05)
+    url = "/api/v1/servers/alpha/plugins"
+    assert client.put(f"{url}/no-such-plugin", headers=ALICE).status_code == 404
+    assert client.delete(f"{url}/fiefs", headers=ALICE).status_code == 404
+
+    def fail(name, text):
+        raise ClusterError("kubectl apply failed")
+
+    with monkeypatch.context() as broken:
+        broken.setattr(cluster, "write_plugin_selection", fail)
+        assert client.put(f"{url}/fiefs", headers=ALICE).status_code == 502
+
+    assert client.put(f"{url}/fiefs", headers=ALICE).status_code == 200
+    assert "fiefs" in selection(cluster)
+
+
+def test_a_change_gives_up_waiting_behind_a_hung_write(alpha, client, cluster, monkeypatch):
+    writing, finish = threading.Event(), threading.Event()
+    real_write = cluster.write_plugin_selection
+
+    def write(name, text):
+        writing.set()
+        assert finish.wait(5)
+        real_write(name, text)
+
+    monkeypatch.setattr(cluster, "write_plugin_selection", write)
+    monkeypatch.setattr("dsh_api.plugin_service.CHANGE_WAIT_SECONDS", 0.05)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(client.put, "/api/v1/servers/alpha/plugins/fiefs", headers=ALICE)
+        assert writing.wait(5)
+        gave_up = client.put("/api/v1/servers/alpha/plugins/currencies", headers=ALICE)
+        finish.set()
+
+    assert gave_up.status_code == 409
+    assert "fiefs" in selection(cluster)
+    assert "currencies" not in selection(cluster)
 
 
 # --- applying ----------------------------------------------------------------
