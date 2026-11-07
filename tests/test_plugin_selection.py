@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 from dsh_api.auth import FakeValidator
 from dsh_api.catalog import CatalogPlugin, FakeCatalog, extras_from_defaults
-from dsh_api.cluster import WrapperStatus
+from dsh_api.cluster import ClusterError, WrapperStatus
 from dsh_api.config import DEFAULT_PLUGINS, split_csv
 from dsh_api.main import create_app
 from dsh_api.selection import selection_sha256
@@ -309,6 +309,23 @@ def test_a_change_that_waited_is_refused_once_the_server_is_being_deleted(
 
     assert waited.result().status_code == 409
     assert "currencies" not in selection(cluster)
+
+
+def test_a_refused_change_does_not_hold_the_server_up(alpha, client, cluster, monkeypatch):
+    monkeypatch.setattr("dsh_api.plugin_service.CHANGE_WAIT_SECONDS", 0.05)
+    url = "/api/v1/servers/alpha/plugins"
+    assert client.put(f"{url}/no-such-plugin", headers=ALICE).status_code == 404
+    assert client.delete(f"{url}/fiefs", headers=ALICE).status_code == 404
+
+    def fail(name, text):
+        raise ClusterError("kubectl apply failed")
+
+    with monkeypatch.context() as broken:
+        broken.setattr(cluster, "write_plugin_selection", fail)
+        assert client.put(f"{url}/fiefs", headers=ALICE).status_code == 502
+
+    assert client.put(f"{url}/fiefs", headers=ALICE).status_code == 200
+    assert "fiefs" in selection(cluster)
 
 
 def test_a_change_gives_up_waiting_behind_a_hung_write(alpha, client, cluster, monkeypatch):
