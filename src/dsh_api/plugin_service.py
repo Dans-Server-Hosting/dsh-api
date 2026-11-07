@@ -8,6 +8,10 @@ one ``apply`` restarts the pod (asking first when players are online).
 
 from __future__ import annotations
 
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 from dsh_api.catalog import CatalogPlugin, CatalogUnavailable, PluginCatalog
 from dsh_api.cluster import ClusterBackend
 from dsh_api.config import Settings
@@ -16,6 +20,7 @@ from dsh_api.selection import default_selection, selection_json, selection_sha25
 from dsh_api.service import PlayersOnline, ServerService
 
 RESTART_WARNING = "say This server is restarting in a moment to change its plugins."
+CHANGE_WAIT_SECONDS = 30.0
 
 # What the boot script reports per slug, as the portal shows it.
 _ON_DISK = {"installed", "present", "adopted"}
@@ -62,6 +67,8 @@ class PluginService:
         self.cluster = cluster
         self.servers = servers
         self.catalog = catalog
+        self._locks_guard = threading.Lock()
+        self._locks: dict[str, threading.Lock] = {}
 
     def _require_enabled(self) -> None:
         if not self.settings.plugin_selection:
@@ -144,6 +151,27 @@ class PluginService:
         if row.status != "ready":
             raise ServerBusy({"provisioning": "being created"}.get(row.status, row.status))
 
+    @contextmanager
+    def _changing(self, tenant_id: str, name: str) -> Iterator[None]:
+        """One selection change at a time on a server, so the whole list written
+        to the ConfigMap is never built from rows another change is replacing.
+        A lock in this process is enough: the API is one replica, one worker.
+
+        Checked before the lock, so only a tenant's own ready server gets one,
+        and again inside it, because a wait can outlast a delete. The wait is
+        capped: kubectl has no timeout, and a hung write must not fill the
+        request thread pool with changes queued behind it."""
+        self._ready(tenant_id, name)
+        with self._locks_guard:
+            lock = self._locks.setdefault(name, threading.Lock())
+        if not lock.acquire(timeout=CHANGE_WAIT_SECONDS):
+            raise ServerBusy("changing its plugins")
+        try:
+            self._ready(tenant_id, name)
+            yield
+        finally:
+            lock.release()
+
     def _write(self, name: str, rows: list[SelectedPlugin]) -> None:
         """The ConfigMap first: if it cannot be written, the selection is unchanged."""
         text = selection_json(rows)
@@ -154,45 +182,45 @@ class PluginService:
         """Select ``slug`` and whatever it requires that is not selected yet,
         each pinned to the catalog's latest release now."""
         self._require_enabled()
-        self._ready(tenant_id, name)
-        rows = self._rows(name)
-        selected = {r.slug for r in rows}
-        catalog = self.catalog.plugins()
-        if slug not in catalog:
-            raise UnknownPlugin(slug)
-        new: list[SelectedPlugin] = []
-        queue: list[tuple[str, str]] = [(slug, "tenant")]
-        while queue:
-            current, added_by = queue.pop(0)
-            if current in selected:
-                continue
-            entry = catalog.get(current)
-            if entry is None:
-                raise UnknownPlugin(current)
-            new.append(_selected_from(entry, added_by))
-            selected.add(current)
-            queue.extend((dep, "dependency") for dep in entry.requires)
-        if new:
-            self._write(name, rows + new)
-            self.db.add_plugins(name, new)
-            self.db.record(tenant_id, name, "plugins.add", ",".join(r.slug for r in new))
+        with self._changing(tenant_id, name):
+            rows = self._rows(name)
+            selected = {r.slug for r in rows}
+            catalog = self.catalog.plugins()
+            if slug not in catalog:
+                raise UnknownPlugin(slug)
+            new: list[SelectedPlugin] = []
+            queue: list[tuple[str, str]] = [(slug, "tenant")]
+            while queue:
+                current, added_by = queue.pop(0)
+                if current in selected:
+                    continue
+                entry = catalog.get(current)
+                if entry is None:
+                    raise UnknownPlugin(current)
+                new.append(_selected_from(entry, added_by))
+                selected.add(current)
+                queue.extend((dep, "dependency") for dep in entry.requires)
+            if new:
+                self._write(name, rows + new)
+                self.db.add_plugins(name, new)
+                self.db.record(tenant_id, name, "plugins.add", ",".join(r.slug for r in new))
         return {"added": [r.slug for r in new], **self.view(tenant_id, name)}
 
     def remove(self, tenant_id: str, name: str, slug: str) -> dict:
         """Deselect ``slug``. Refused while another selected plugin requires it.
         The jar goes at the next start; its data folder is always kept."""
         self._require_enabled()
-        self._ready(tenant_id, name)
-        rows = self._rows(name)
-        if slug not in {r.slug for r in rows}:
-            raise PluginNotSelected(slug)
-        dependents = sorted(r.slug for r in rows if slug in r.requires and r.slug != slug)
-        if dependents:
-            raise PluginRequired(slug, dependents)
-        remaining = [r for r in rows if r.slug != slug]
-        self._write(name, remaining)
-        self.db.remove_plugin(name, slug)
-        self.db.record(tenant_id, name, "plugins.remove", slug)
+        with self._changing(tenant_id, name):
+            rows = self._rows(name)
+            if slug not in {r.slug for r in rows}:
+                raise PluginNotSelected(slug)
+            dependents = sorted(r.slug for r in rows if slug in r.requires and r.slug != slug)
+            if dependents:
+                raise PluginRequired(slug, dependents)
+            remaining = [r for r in rows if r.slug != slug]
+            self._write(name, remaining)
+            self.db.remove_plugin(name, slug)
+            self.db.record(tenant_id, name, "plugins.remove", slug)
         # Dependencies nothing selected needs any more are offered for removal,
         # never removed unasked.
         unused = sorted(

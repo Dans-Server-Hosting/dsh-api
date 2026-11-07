@@ -10,7 +10,9 @@ asset, so installs made from DSH show up in the site's download counts.
 
 from __future__ import annotations
 
+import http.client
 import json
+import logging
 import threading
 import time
 import urllib.error
@@ -20,6 +22,8 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from dsh_api.plugins import describe_plugin, jar_name_and_version
+
+log = logging.getLogger(__name__)
 
 DPC_API = "https://api.dansplugins.com"
 DPC_SITE = "https://dansplugins.com"
@@ -106,12 +110,23 @@ def extras_from_defaults(default_urls: Iterable[str]) -> dict[str, CatalogPlugin
     return extras
 
 
+def _strings(value: object) -> tuple[str, ...] | None:
+    """A ``tags`` or ``requires`` field; None when it is not a list. A bare
+    string must not iterate into one-letter dependencies."""
+    if not value:
+        return ()
+    return tuple(str(v) for v in value) if isinstance(value, list) else None
+
+
 def parse_dpc(plugins: object, latest: object, api: str = DPC_API) -> dict[str, CatalogPlugin]:
     """Join DPC's plugin list with its latest versions. A plugin with no
-    release (nothing to download) is left out."""
+    release (nothing to download) is left out, and so is a malformed entry: one
+    bad plugin must not take the rest of the catalog down with it."""
     if not isinstance(plugins, list) or not isinstance(latest, list):
         raise ValueError("unexpected catalog shape")
-    releases = {r.get("slug"): r for r in latest if isinstance(r, dict)}
+    releases = {
+        r["slug"]: r for r in latest if isinstance(r, dict) and isinstance(r.get("slug"), str)
+    }
     catalog: dict[str, CatalogPlugin] = {}
     for p in plugins:
         if not isinstance(p, dict) or not isinstance(p.get("slug"), str):
@@ -119,14 +134,18 @@ def parse_dpc(plugins: object, latest: object, api: str = DPC_API) -> dict[str, 
         release = releases.get(p["slug"])
         if not release or not release.get("downloadPath") or not release.get("downloadUrl"):
             continue
+        tags, requires = _strings(p.get("tags")), _strings(p.get("requires"))
+        if tags is None or requires is None or not release.get("tag"):
+            log.warning("leaving malformed catalog entry %r out", p["slug"])
+            continue
         icon = p.get("iconPath")
         icon_ok = isinstance(icon, str) and icon.startswith("/")
         catalog[p["slug"]] = CatalogPlugin(
             slug=p["slug"],
             title=str(p.get("title") or p["slug"]),
             description=str(p.get("description") or ""),
-            tags=tuple(str(t) for t in p.get("tags") or ()),
-            requires=tuple(str(r) for r in p.get("requires") or ()),
+            tags=tags,
+            requires=requires,
             tag=str(release["tag"]),
             filename=str(release["downloadUrl"]).rsplit("/", 1)[-1],
             url=api + str(release["downloadPath"]),
@@ -174,7 +193,13 @@ class DpcCatalog:
                     self._fetch(f"{self.api}/api/v1/plugins/versions/latest", self.timeout),
                     self.api,
                 )
-            except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                OSError,
+                ValueError,
+                http.client.HTTPException,  # a response cut off partway
+            ) as exc:
                 if self._cached is not None:
                     return self._cached
                 raise CatalogUnavailable(f"the plugin catalog could not be read ({exc})") from exc

@@ -1,3 +1,4 @@
+import http.client
 import urllib.error
 
 import pytest
@@ -59,6 +60,55 @@ def test_joins_plugins_with_their_latest_release_through_the_counting_url():
 
 def test_a_plugin_with_no_release_is_left_out():
     assert "unreleased" not in parse_dpc(PLUGINS, LATEST)
+
+
+def test_a_release_without_a_tag_is_left_out_and_the_rest_are_kept():
+    latest = [{k: v for k, v in LATEST[0].items() if k != "tag"}, LATEST[1]]
+    assert set(parse_dpc(PLUGINS, latest)) == {"fiefs"}
+
+
+@pytest.mark.parametrize("field", ["tags", "requires"])
+@pytest.mark.parametrize("value", [7, True, "fiefs", {"a": 1}])
+def test_a_tags_or_requires_that_is_not_a_list_leaves_the_entry_out(field, value):
+    plugins = [{**PLUGINS[0], field: value}, PLUGINS[1]]
+    assert set(parse_dpc(plugins, LATEST)) == {"fiefs"}
+
+
+def test_a_release_with_an_unhashable_slug_is_ignored():
+    assert "fiefs" in parse_dpc(PLUGINS, [{"slug": ["fiefs"]}, *LATEST])
+
+
+def test_a_malformed_entry_leaves_the_rest_of_a_refresh_standing():
+    plugins = [{**PLUGINS[0], "tags": 7}, PLUGINS[1]]
+
+    def fetch(url, timeout):
+        return plugins if url.endswith("/plugins") else LATEST
+
+    assert set(DpcCatalog(fetch=fetch).plugins()) == {"fiefs"}
+
+
+def test_serves_the_last_good_copy_when_a_response_is_cut_off():
+    state = {"up": True}
+
+    def fetch(url, timeout):
+        if not state["up"]:
+            raise http.client.IncompleteRead(b"[")
+        return PLUGINS if url.endswith("/plugins") else LATEST
+
+    clock = Clock()
+    catalog = DpcCatalog(fetch=fetch, ttl=10, clock=clock)
+    catalog.plugins()
+    state["up"] = False
+    clock.now = 100
+    assert "fiefs" in catalog.plugins()
+
+
+def test_raises_unavailable_when_a_response_is_cut_off_and_nothing_is_cached():
+    def fetch(url, timeout):
+        raise http.client.IncompleteRead(b"[")
+
+    with pytest.raises(CatalogUnavailable):
+        DpcCatalog(fetch=fetch).plugins()
 
 
 def test_default_plugins_map_to_catalog_and_extra_slugs():
