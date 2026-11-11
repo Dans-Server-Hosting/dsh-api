@@ -26,6 +26,16 @@ def split_csv(value: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in value.split(",") if item.strip())
 
 
+THUMBNAIL_MODES = ("off", "manual", "auto")
+
+
+def thumbnail_mode(value: str) -> str:
+    """``DSH_WORLD_THUMBNAILS``; anything unrecognised is ``off``, so a typo
+    never switches the feature on."""
+    value = value.strip().lower()
+    return value if value in THUMBNAIL_MODES else "off"
+
+
 @dataclass(frozen=True)
 class Limits:
     """The free-tier profile, as numbers the portal can display.
@@ -100,6 +110,15 @@ class Settings:
     """Key for signed download links; derived from the JWT secret when unset."""
     public_api_url: str = ""
     """Where download links point; ``https://api.<base_domain>`` when unset."""
+    world_thumbnails: str = "off"
+    """Rotating world thumbnails (RFC 0034): ``off`` (every thumbnail route
+    answers 503), ``manual`` (drawn only when the owner presses Refresh) or
+    ``auto``. ``auto`` is accepted but runs as ``manual``: the scheduled sweep
+    is not built until the owner decides RFC 0034's first open question."""
+    thumbnail_image: str = "dsh-world-thumbnail:local"
+    thumbnail_size: int = 128
+    thumbnail_daily_limit: int = 3
+    thumbnail_timeout_seconds: int = 120
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Settings:
@@ -138,7 +157,20 @@ class Settings:
             ),
             export_link_secret=env.get("DSH_EXPORT_LINK_SECRET", cls.export_link_secret),
             public_api_url=env.get("DSH_PUBLIC_API_URL", cls.public_api_url),
+            world_thumbnails=thumbnail_mode(env.get("DSH_WORLD_THUMBNAILS", cls.world_thumbnails)),
+            thumbnail_image=env.get("DSH_THUMBNAIL_IMAGE", cls.thumbnail_image),
+            thumbnail_size=int(env.get("DSH_THUMBNAIL_SIZE", cls.thumbnail_size)),
+            thumbnail_daily_limit=int(
+                env.get("DSH_THUMBNAIL_DAILY_LIMIT", cls.thumbnail_daily_limit)
+            ),
+            thumbnail_timeout_seconds=int(
+                env.get("DSH_THUMBNAIL_TIMEOUT_SECONDS", cls.thumbnail_timeout_seconds)
+            ),
         )
+
+    @property
+    def thumbnails_on(self) -> bool:
+        return self.world_thumbnails in ("manual", "auto")
 
     def is_admin(self, username: str) -> bool:
         return username in self.admin_users

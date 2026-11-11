@@ -43,6 +43,13 @@ from dsh_api.service import (
     TenantAtCap,
     validate_name,
 )
+from dsh_api.thumbnail_service import (
+    ThumbnailConflict,
+    ThumbnailDisabled,
+    ThumbnailLimit,
+    ThumbnailNotFound,
+    ThumbnailService,
+)
 
 
 class CreateServer(BaseModel):
@@ -129,6 +136,11 @@ def create_app(
     if settings.world_export:
         exports.recover_interrupted()
         exports.sweep()
+    # Thumbnails (RFC 0034) share the export executor: one pod at a time.
+    thumbnails = ThumbnailService(settings, db, cluster, service, export_jobs)
+    if settings.thumbnails_on:
+        thumbnails.recover_interrupted()
+        thumbnails.sweep()
 
     app = FastAPI(title="dsh-api", version=__version__)
     app.state.settings = settings
@@ -136,6 +148,7 @@ def create_app(
     app.state.feedback = feedback
     app.state.jobs = jobs
     app.state.exports = exports
+    app.state.thumbnails = thumbnails
 
     def current_tenant(authorization: Annotated[str | None, Header()] = None) -> str:
         try:
@@ -200,6 +213,29 @@ def create_app(
             headers={"Retry-After": str(exc.retry_after)},
         )
 
+    @app.exception_handler(ThumbnailDisabled)
+    def _thumbnails_disabled(_: Request, exc: ThumbnailDisabled) -> JSONResponse:
+        return JSONResponse({"detail": "world thumbnails are not enabled"}, status_code=503)
+
+    @app.exception_handler(ThumbnailNotFound)
+    def _thumbnail_not_found(_: Request, exc: ThumbnailNotFound) -> JSONResponse:
+        return JSONResponse({"detail": "no picture yet"}, status_code=404)
+
+    @app.exception_handler(ThumbnailConflict)
+    def _thumbnail_conflict(_: Request, exc: ThumbnailConflict) -> JSONResponse:
+        return JSONResponse({"detail": str(exc)}, status_code=409)
+
+    @app.exception_handler(ThumbnailLimit)
+    def _thumbnail_limit(_: Request, exc: ThumbnailLimit) -> JSONResponse:
+        return JSONResponse(
+            {
+                "detail": f"the picture can be refreshed {exc.limit} times a day; try again later",
+                "retry_after": exc.retry_after,
+            },
+            status_code=429,
+            headers={"Retry-After": str(exc.retry_after)},
+        )
+
     @app.exception_handler(InvalidArea)
     def _invalid_area(_: Request, exc: InvalidArea) -> JSONResponse:
         return JSONResponse({"detail": str(exc)}, status_code=422)
@@ -225,6 +261,7 @@ def create_app(
             "servers_per_tenant": settings.max_servers_per_tenant,
             **asdict(settings.limits),
             **exports.limits(),
+            **thumbnails.limits(),
         }
 
     @app.get("/api/v1/default-plugins")
@@ -390,6 +427,36 @@ def create_app(
             filename=filename,
             headers={"Cache-Control": "private, no-store"},
         )
+
+    # --- world thumbnails (RFC 0034); 503 while DSH_WORLD_THUMBNAILS is off --------
+
+    @app.get("/api/v1/servers/{name}/thumbnail")
+    def get_thumbnail(tenant: Tenant, name: str) -> dict:
+        """The server's picture: ``status`` (``queued``/``running``/``ready``/
+        ``failed``), ``has_picture`` and what it shows; 404 when there is none
+        and none was asked for."""
+        return thumbnails.view(tenant, name)
+
+    @app.post("/api/v1/servers/{name}/thumbnail", status_code=202)
+    def refresh_thumbnail(tenant: Tenant, name: str) -> dict:
+        """Draw the picture again from a read-only copy of the world around
+        spawn. Answers at once with ``queued``; the old picture stays until
+        the new one is ready."""
+        return thumbnails.request(tenant, name)
+
+    @app.get("/api/v1/servers/{name}/thumbnail/{file}")
+    def thumbnail_file(
+        tenant: Tenant,
+        name: str,
+        file: str,
+        if_none_match: Annotated[str | None, Header()] = None,
+    ) -> Response:
+        """``thumb.webp`` (animated) or ``poster.png`` (its first frame)."""
+        path, media, etag = thumbnails.file(tenant, name, file)
+        headers = {"Cache-Control": "private, max-age=300", "ETag": etag}
+        if if_none_match == etag:
+            return Response(status_code=304, headers=headers)
+        return FileResponse(path, media_type=media, headers=headers)
 
     @app.get("/api/v1/me")
     def me(tenant: Tenant) -> dict:

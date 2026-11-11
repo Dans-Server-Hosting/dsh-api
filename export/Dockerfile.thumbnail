@@ -1,0 +1,44 @@
+# syntax=docker/dockerfile:1
+# The world-thumbnail image (RFC 0034): the world-export image plus what
+# `dsh-world-export --thumbnail` needs to draw a turntable headless with Strata.
+# A separate image (RFC 0034 §6), so exports keep their smaller image and a
+# broken Mesa build cannot break them. dsh-api runs it exactly like the export
+# pod: read-only world, no network, no token, the same deadline and limits.
+#
+#   docker build -t dsh-world-export:local export/
+#   docker build -t dsh-world-thumbnail:local --build-arg BASE=dsh-world-export:local \
+#     -f export/Dockerfile.thumbnail export/
+ARG BASE=dsh-world-export:local
+FROM ${BASE}
+
+# strata-engine (Strata's Python binding) has no PyPI release: the tag of the
+# libstrata release pinned in the exporter's mcusd/strata.lock.json. Move them
+# together, and only with EXPORTER_PIN in ./Dockerfile.
+ARG STRATA_BINDING_TAG=v0.6.0
+ARG PILLOW_VERSION=12.0.0
+
+USER root
+COPY fetch_libstrata.py /tmp/fetch_libstrata.py
+# Mesa's EGL + llvmpipe (no GPU on the node), then the binding, Pillow and the
+# pinned libstrata, checked against the lock's SHA-256 here: the pod itself has
+# no network, so nothing is ever fetched at run time.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libegl1 libegl-mesa0 libgl1-mesa-dri git \
+    && pip install --no-cache-dir \
+        "strata-engine @ git+https://github.com/Preponderous-Software/strata@${STRATA_BINDING_TAG}#subdirectory=bindings/python" \
+        "pillow==${PILLOW_VERSION}" \
+    && python /tmp/fetch_libstrata.py /opt/strata/libstrata.so \
+    && rm /tmp/fetch_libstrata.py \
+    && apt-get purge -y git && apt-get autoremove -y && rm -rf /var/lib/apt/lists/* \
+    && mc-usd-thumbnail --help > /dev/null && dsh-world-export --help | grep -q -- --thumbnail
+
+# Headless, software-rendered, one rasteriser thread (the pod's CPU limit is
+# 500m), no shader cache on the read-only root, the pinned library only.
+ENV MCUSD_STRATA_LIB=/opt/strata/libstrata.so \
+    LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe LP_NUM_THREADS=1 \
+    MESA_SHADER_CACHE_DISABLE=true \
+    STRATA_BINDING_TAG=${STRATA_BINDING_TAG}
+
+USER 1000:1000
+WORKDIR /work
+CMD ["sleep", "900"]

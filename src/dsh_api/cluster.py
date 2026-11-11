@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import secrets
 import socket
 import struct
@@ -29,8 +30,11 @@ from dsh_api.export_pod import (
     export_pod_manifest,
     export_pod_name,
     extract_export,
+    extract_thumbnail,
     stream_command,
 )
+
+log = logging.getLogger(__name__)
 
 TENANT_CLUSTER_ROLE = "dsh-api-tenant"
 """The ClusterRole with the namespaced rules (deploy/rbac.yaml), bound into
@@ -204,8 +208,25 @@ class ClusterBackend(Protocol):
         the pod. ``on_phase`` gets the pod's ``phase=`` progress. Raises
         ``ClusterError`` with a message fit for the owner."""
 
+    def run_world_thumbnail(
+        self,
+        name: str,
+        run_id: str,
+        *,
+        image: str,
+        args: list[str],
+        dest: Path,
+        timeout: float,
+        on_phase: Callable[[str], None],
+    ) -> None:
+        """Run one thumbnail run (RFC 0034): the export pod with the thumbnail
+        image, ``dsh-world-export --thumbnail <args>``, unpacking only
+        ``thumb.webp``, ``poster.png`` and ``thumbnail.json`` into ``dest``.
+        Raises ``ClusterError`` with a message fit for the owner."""
+
     def delete_world_export_pods(self, name: str) -> None:
-        """Remove any export pods left in ``t-<name>`` (after an API restart)."""
+        """Remove any export pods left in ``t-<name>`` (after an API restart);
+        thumbnail runs use the same pods and go too."""
 
     def uninstall_release(self, name: str) -> None: ...
 
@@ -503,6 +524,18 @@ def export_failure_message(code: int, tail: list[str]) -> str:
     return f"the export failed (exit status {code})"
 
 
+def thumbnail_failure_message(code: int, tail: list[str]) -> str:
+    """As :func:`export_failure_message`, for a thumbnail run (RFC 0034)."""
+    if code == -9:
+        return "drawing the picture took too long and was stopped"
+    if code == 137:
+        return "drawing the picture ran out of memory"
+    for line in reversed(tail):
+        if line.startswith("error: "):
+            return line.removeprefix("error: ")[:300]
+    return f"the picture could not be drawn (exit status {code})"
+
+
 class KubectlHelmBackend:
     def __init__(
         self,
@@ -767,6 +800,52 @@ class KubectlHelmBackend:
         timeout: float,
         on_phase: Callable[[str], None],
     ) -> None:
+        self._run_export_pod(
+            name,
+            export_id,
+            kind="export",
+            image=image,
+            args=args,
+            dest=dest,
+            timeout=timeout,
+            on_phase=on_phase,
+        )
+
+    def run_world_thumbnail(
+        self,
+        name: str,
+        run_id: str,
+        *,
+        image: str,
+        args: list[str],
+        dest: Path,
+        timeout: float,
+        on_phase: Callable[[str], None],
+    ) -> None:
+        self._run_export_pod(
+            name,
+            run_id,
+            kind="thumbnail",
+            image=image,
+            args=["--thumbnail", *args],
+            dest=dest,
+            timeout=timeout,
+            on_phase=on_phase,
+        )
+
+    def _run_export_pod(
+        self,
+        name: str,
+        export_id: str,
+        *,
+        kind: str,
+        image: str,
+        args: list[str],
+        dest: Path,
+        timeout: float,
+        on_phase: Callable[[str], None],
+    ) -> None:
+        thumbnail = kind == "thumbnail"
         ns = namespace_for(name)
         claim = f"{name}{WRAPPER_PVC_SUFFIX}"
         self._run(["kubectl", "apply", "-f", "-"], stdin=json.dumps(export_network_policy(ns)))
@@ -776,13 +855,16 @@ class KubectlHelmBackend:
         except ClusterError as exc:
             raise ClusterError("the server has no world yet") from exc
         pod = export_pod_name(export_id)
-        manifest = export_pod_manifest(ns, export_id, claim, image)
+        manifest = export_pod_manifest(ns, export_id, claim, image, kind)
         try:
             self._run(["kubectl", "apply", "-f", "-"], stdin=json.dumps(manifest))
         except ClusterError as exc:
             if "exceeded quota" in str(exc):
                 raise ClusterError(
-                    "the server has no room for an export right now; try again while it is asleep"
+                    "the server has no room to draw its picture right now"
+                    if thumbnail
+                    else "the server has no room for an export right now;"
+                    " try again while it is asleep"
                 ) from exc
             raise
         try:
@@ -792,7 +874,12 @@ class KubectlHelmBackend:
                     f"--timeout={READY_TIMEOUT}",
                 ])  # fmt: skip
             except ClusterError as exc:
-                raise ClusterError(self._export_pod_problem(ns, pod)) from exc
+                problem = self._export_pod_problem(ns, pod)
+                if thumbnail:
+                    problem = problem.replace("an export", "drawing its picture").replace(
+                        "the export", "the picture"
+                    )
+                raise ClusterError(problem) from exc
             dest.mkdir(parents=True, exist_ok=True)
             archive = dest / "export.tgz"
 
@@ -808,8 +895,12 @@ class KubectlHelmBackend:
                     timeout,
                 )
                 if code != 0:
+                    if thumbnail:
+                        # dsh-world-export's `detail:` line is for the operator only.
+                        log.warning("thumbnail run %s of %s failed: %s", export_id, name, tail[-3:])
+                        raise ClusterError(thumbnail_failure_message(code, tail))
                     raise ClusterError(export_failure_message(code, tail))
-                extract_export(archive, dest)
+                (extract_thumbnail if thumbnail else extract_export)(archive, dest)
             except UnsafeArchive as exc:
                 raise ClusterError(str(exc)) from exc
             finally:
@@ -903,6 +994,9 @@ class FakeClusterBackend:
     export_failures: dict[str, str] = field(default_factory=dict)
     """Per server, the owner-facing error the next export fails with."""
     exports_run: list[tuple[str, str, tuple[str, ...]]] = field(default_factory=list)
+    thumbnail_failures: dict[str, str] = field(default_factory=dict)
+    """Per server, the owner-facing error the next thumbnail run fails with."""
+    thumbnails_run: list[tuple[str, str, tuple[str, ...], str]] = field(default_factory=list)
     ops: list[tuple] = field(default_factory=list)
     fail_on: set[str] = field(default_factory=set)
 
@@ -1073,6 +1167,43 @@ class FakeClusterBackend:
         (dest / "preview" / "t.0.0.0123456789ab.uwt").write_bytes(b"\x1f\x8b fake tile")
         summary["stats"]["zip_bytes"] = (dest / "world.zip").stat().st_size
         (dest / "summary.json").write_text(json.dumps(summary))
+
+    def run_world_thumbnail(
+        self,
+        name: str,
+        run_id: str,
+        *,
+        image: str,
+        args: list[str],
+        dest: Path,
+        timeout: float,
+        on_phase: Callable[[str], None],
+    ) -> None:
+        self._op("run_world_thumbnail", name, run_id)
+        self._require_binding(name)
+        if name not in self.releases:
+            raise ClusterError("the server has no world yet")
+        self.thumbnails_run.append((name, run_id, tuple(args), image))
+        for phase in ("copying", "exporting", "thumbnail"):
+            on_phase(phase)
+        if name in self.thumbnail_failures:
+            raise ClusterError(self.thumbnail_failures.pop(name))
+        on_phase("packaging")
+        state = args[args.index("--server-state") + 1] if "--server-state" in args else "awake"
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "thumb.webp").write_bytes(b"RIFF\x10\x00\x00\x00WEBPVP8X fake " + run_id.encode())
+        (dest / "poster.png").write_bytes(b"\x89PNG\r\n\x1a\n fake " + run_id.encode())
+        meta = {
+            "version": 1,
+            "area": {"x1": -64, "z1": -64, "x2": 63, "z2": 63},
+            "spawn": {"x": 0, "z": 0},
+            "snapshot": "at_rest" if state == "asleep" else "live_stable",
+            "strata": "0.6.0",
+            "frames": 12,
+            "size": [200, 132],
+            "ms": 250,
+        }
+        (dest / "thumbnail.json").write_text(json.dumps(meta))
 
     def delete_world_export_pods(self, name: str) -> None:
         self._op("delete_world_export_pods", name)

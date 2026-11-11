@@ -21,6 +21,11 @@ data:
   DSH_WORLD_EXPORT: "false"
   DSH_EXPORT_IMAGE: "dsh-world-export:local"
   DSH_EXPORT_DIR: /exports
+  # Rotating world thumbnails (RFC 0034): off | manual | auto (auto runs as
+  # manual for now). Leave "off" until the thumbnail image
+  # (export/Dockerfile.thumbnail) is on the node under DSH_THUMBNAIL_IMAGE.
+  DSH_WORLD_THUMBNAILS: "off"
+  DSH_THUMBNAIL_IMAGE: "dsh-world-thumbnail:local"
   DSH_DB_PATH: /data/dsh-api.db
   DSH_BACKUP_DIR: /backups
   OMCSI_CHART_DIR: /opt/omcsi
