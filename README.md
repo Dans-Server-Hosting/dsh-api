@@ -96,6 +96,9 @@ never fails a list or get.
 | `POST` | `/api/v1/servers/{name}/exports/{id}/link` | `{url, expires_at}`: a signed link to the zip, valid for 15 minutes; 409 until `ready` |
 | `GET` | `/api/v1/export-downloads/{token}` | **no token needed**: the signed link is the credential; the zip as `<server>-world-<id>.zip`. 404 for a bad, expired or deleted link |
 | `DELETE` | `/api/v1/servers/{name}/exports/{id}` | 204; 409 while it is queued/running |
+| `GET` | `/api/v1/servers/{name}/thumbnail` | the server's world thumbnail (see [World thumbnails](#world-thumbnails-rfc-0034)): `{server, status: queued\|running\|ready\|failed, phase, error, requested_at, rendered_at, has_picture, area, spawn, snapshot, strata, frames, size, ms, exporter_commit}`; 404 when there is none and none was asked for. Every thumbnail route answers 503 while `DSH_WORLD_THUMBNAILS` is `off` |
+| `POST` | `/api/v1/servers/{name}/thumbnail` | draw it again → **202** with `queued`; the old picture stays until the new one is ready. 409 while a run is queued/running or the server is provisioning/deleting/failing; 429 `{retry_after}` past `DSH_THUMBNAIL_DAILY_LIMIT` runs of the server in 24 hours |
+| `GET` | `/api/v1/servers/{name}/thumbnail/{file}` | `thumb.webp` (animated, loops) or `poster.png` (its first frame, for reduced motion); `Cache-Control: private, max-age=300`, `ETag` from the render time (304 on `If-None-Match`); 404 otherwise |
 | `GET` | `/api/v1/me` | `{username, is_admin}` for the caller; admins are the `DSH_ADMIN_USERS` logins |
 | `POST` | `/api/v1/feedback` | `{message (1–4000 chars), page?}` → 201; any signed-in user, at most 10 per user per hour (429, decided in the SQLite statement that stores the message, so concurrent submissions cannot pass it) |
 | `GET` | `/api/v1/feedback?status=new\|read\|all` | admin only (403 otherwise); newest first, default `new` |
@@ -183,6 +186,11 @@ OMCSI checkout at `OMCSI_CHART_DIR` (the image provides all three).
 | `DSH_EXPORT_TIMEOUT_SECONDS` | `600` | the API stops a run after this; the pod's own deadline is 900 s |
 | `DSH_EXPORT_LINK_SECRET` | *(derived from the JWT secret)* | key for signed download links |
 | `DSH_PUBLIC_API_URL` | `https://api.<domain>` | where download links point |
+| `DSH_WORLD_THUMBNAILS` | `off` | `off`, `manual` (owners press Refresh) or `auto` (accepted, runs as `manual` until the scheduled sweep is decided); see World thumbnails. Anything else is `off` |
+| `DSH_THUMBNAIL_IMAGE` | `dsh-world-thumbnail:local` | the image built from `export/Dockerfile.thumbnail` |
+| `DSH_THUMBNAIL_SIZE` | `128` | blocks a side of the box around spawn the picture shows |
+| `DSH_THUMBNAIL_DAILY_LIMIT` | `3` | runs per server per rolling 24 hours |
+| `DSH_THUMBNAIL_TIMEOUT_SECONDS` | `120` | the API stops a run after this; the pod's own deadline is 900 s |
 | `DSH_LIMIT_HEAP_GB` | `3` | free-tier profile served by `GET /api/v1/limits` |
 | `DSH_LIMIT_MEMORY_LIMIT_GIB` | `3.5` | " |
 | `DSH_LIMIT_WORLD_QUOTA_GIB` | `5` | " |
@@ -287,6 +295,34 @@ the portal takes as "hide the section". While it is on:
   404 everywhere, links included); its files are swept at startup and, at most
   every 10 minutes, when exports are listed or started.
 
+## World thumbnails (RFC 0034)
+
+Off until `DSH_WORLD_THUMBNAILS=manual`; every route answers 503 until then,
+which the portal takes as "no picture". `GET /api/v1/limits` reports
+`thumbnail_mode` (`off` or `manual`) so the portal knows whether to offer
+Refresh. While it is on:
+
+- `POST .../thumbnail` checks ownership and the server's state, marks the
+  server's one thumbnail row `queued` and answers; one run per server and the
+  per-server daily limit are decided in the same SQLite statement (the limit
+  counts `thumbnail.requested` events).
+- A run goes through the **same one-worker executor as exports**, so the node
+  never runs more than one export or thumbnail pod. It is the export pod
+  unchanged (labels, NetworkPolicy, read-only world, no token, deadline,
+  requests and limits, plus `LP_NUM_THREADS=1`) with `DSH_THUMBNAIL_IMAGE`,
+  running `dsh-world-export --thumbnail`: a `DSH_THUMBNAIL_SIZE` box around
+  spawn, exported and drawn as a 12-frame Strata turntable.
+- The tar is unpacked accepting only `thumb.webp`, `poster.png` and
+  `thumbnail.json`, each checked to be the type its name says, within 4 MB,
+  then moved file by file into `DSH_EXPORT_DIR/.thumbnails/<server>/` (the
+  leading dot keeps the export sweeper away). A failed run keeps the previous
+  picture.
+- The picture is served only to the owner's token (the portal proxies it);
+  nothing public points at it. It is deleted with its server, and a sweep at
+  startup and on Refresh removes folders without a server.
+- `auto` (a scheduled sweep over asleep servers) is not built: reading every
+  world on a schedule is the RFC's first open question, left to the owner.
+
 ## World export image
 
 `export/` builds the image the world-export pod runs: Minecraft-USD-Exporter
@@ -308,6 +344,20 @@ docker build -t dsh-world-export:local export/
 export/smoke.sh dsh-world-export:local   # the committed fixture, as the pod runs it
 ```
 
+`export/Dockerfile.thumbnail` builds the thumbnail image `FROM` the export
+image (RFC 0034 §6: a separate image, so a broken Mesa build cannot break
+exports): Mesa's EGL and `llvmpipe`, Pillow, Strata's Python binding and the
+`libstrata` release pinned in the exporter's `mcusd/strata.lock.json`,
+downloaded and SHA-256 checked at build time (the pod has no network).
+`dsh-world-export --thumbnail` then writes a tar of `thumb.webp`,
+`poster.png` and `thumbnail.json`.
+
+```sh
+docker build -t dsh-world-thumbnail:local --build-arg BASE=dsh-world-export:local \
+  -f export/Dockerfile.thumbnail export/
+export/smoke.sh dsh-world-export:local dsh-world-thumbnail:local
+```
+
 ## Layout
 
 ```
@@ -319,6 +369,7 @@ src/dsh_api/
   plugin_service.py  a server's plugin selection: add / remove / apply
   export_service.py  world export (RFC 0021): start, run, links, expiry
   export_pod.py      the export pod and policy manifests, the exec stream, unpacking
+  thumbnail_service.py  world thumbnails (RFC 0034): refresh, run, serve, sweep
   catalog.py   the installable plugins: dansplugins.com, cached (real + fake)
   selection.py the selection.json the wrapper reconciles, and its hash
   feedback.py  submit / list / triage user feedback
@@ -327,6 +378,6 @@ src/dsh_api/
   plugins.py   default-plugin URLs described for GET /api/v1/default-plugins
   config.py    settings and the limits profile
 tests/         pytest, no cluster required
-export/        the world-export image (RFC 0021) and its smoke test
+export/        the world-export image (RFC 0021), the thumbnail image (RFC 0034), their smoke test
 deploy/        Kubernetes manifests
 ```

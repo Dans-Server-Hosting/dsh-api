@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CONFIG_SOURCE = (ROOT / "src" / "dsh_api" / "config.py").read_text()
 ROW = re.compile(r"^\| `([A-Z][A-Z0-9_]*)` \| (.+?) \|", re.MULTILINE)
 FLAGS = ("DSH_PLUGIN_SELECTION", "DSH_WORLD_EXPORT")
+MODES = {"DSH_WORLD_THUMBNAILS": "manual"}  # a mode, not a flag or a number
 LITERAL = re.compile(r"`[^`<>]+`")  # a `<placeholder>` default is a template, not a value
 
 
@@ -32,7 +33,7 @@ def test_the_readme_table_lists_exactly_the_variables_config_reads():
 
 @pytest.mark.parametrize("variable", sorted(readme_table()))
 def test_every_documented_variable_changes_the_settings(variable):
-    value = "true" if variable in FLAGS else "7"
+    value = "true" if variable in FLAGS else MODES.get(variable, "7")
     assert Settings.from_env({variable: value}) != Settings.from_env({})
 
 
@@ -126,3 +127,20 @@ def test_without_an_argument_the_process_environment_is_read(monkeypatch):
 def test_the_link_secret_and_public_url_default_to_empty_so_they_derive():
     s = Settings.from_env({})
     assert s.export_link_secret == "" and s.public_api_url == ""
+
+
+@pytest.mark.parametrize(
+    ("value", "mode", "on"),
+    [
+        ("off", "off", False),
+        ("manual", "manual", True),
+        ("MANUAL ", "manual", True),
+        ("auto", "auto", True),
+        ("true", "off", False),
+        ("on", "off", False),
+        ("", "off", False),
+    ],
+)
+def test_thumbnail_mode_is_off_manual_or_auto_and_anything_else_is_off(value, mode, on):
+    s = Settings.from_env({"DSH_WORLD_THUMBNAILS": value})
+    assert s.world_thumbnails == mode and s.thumbnails_on is on

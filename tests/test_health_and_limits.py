@@ -31,6 +31,8 @@ def test_limits_are_the_free_tier_defaults(client):
         "export_max_size": 512,
         "export_daily_limit": 5,
         "export_retention_hours": 72,
+        "thumbnail_mode": "off",
+        "thumbnail_daily_limit": 3,
     }
 
 

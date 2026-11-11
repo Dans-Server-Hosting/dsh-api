@@ -33,3 +33,15 @@ jobs:
       - uses: actions/checkout@v4
       - run: docker build -t dsh-world-export:ci export/
       - run: export/smoke.sh dsh-world-export:ci
+
+  # The world-thumbnail image (RFC 0034), FROM the export image: build both,
+  # then draw the fixture's turntable the way the pod does and check the
+  # fixture world is unchanged.
+  thumbnail-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t dsh-world-export:ci export/
+      - run: docker build -t dsh-world-thumbnail:ci --build-arg BASE=dsh-world-export:ci -f export/Dockerfile.thumbnail export/
+      - run: docker image ls --format '{{.Repository}}:{{.Tag}} {{.Size}}' | grep dsh-world
+      - run: export/smoke.sh dsh-world-export:ci dsh-world-thumbnail:ci

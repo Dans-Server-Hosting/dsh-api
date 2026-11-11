@@ -18,6 +18,7 @@ from pathlib import Path
 
 EXPORT_LABEL = "dsh.export"
 EXPORT_ID_LABEL = "dsh.export/id"
+EXPORT_KIND_LABEL = "dsh.export/kind"
 EXPORT_POLICY = "dsh-export-isolate"
 POD_DEADLINE_SECONDS = 900
 READY_TIMEOUT = "120s"
@@ -26,17 +27,24 @@ PREVIEW_FILE_RE = re.compile(r"^(index\.json|t\.-?\d+\.-?\d+\.[0-9a-f]{6,64}\.uw
 MAX_UNPACKED_BYTES = 512 * 1024 * 1024
 MAX_MEMBERS = 4096
 PHASES = ("copying", "exporting", "preview", "packaging", "done")
+THUMBNAIL_FILES = ("thumb.webp", "poster.png", "thumbnail.json")
+MAX_THUMBNAIL_BYTES = 4 * 1024 * 1024
 
 
 def export_pod_name(export_id: str) -> str:
     return f"world-export-{export_id}"
 
 
-def export_pod_manifest(namespace: str, export_id: str, claim: str, image: str) -> dict:
+def export_pod_manifest(
+    namespace: str, export_id: str, claim: str, image: str, kind: str = "export"
+) -> dict:
     """A restricted-profile pod: uid/gid 1000 like the wrapper (so the world
     is readable), read-only world, read-only root, no token, no network (see
     :func:`export_network_policy`), and a kubelet-enforced deadline. Its limits
-    fit beside an awake release under the hosted-free quota (RFC 0021 §2)."""
+    fit beside an awake release under the hosted-free quota (RFC 0021 §2).
+
+    A thumbnail run (RFC 0034, ``kind="thumbnail"``) is the same pod with a
+    different image: same labels (so the NetworkPolicy applies), same limits."""
     return {
         "apiVersion": "v1",
         "kind": "Pod",
@@ -46,6 +54,7 @@ def export_pod_manifest(namespace: str, export_id: str, claim: str, image: str) 
             "labels": {
                 EXPORT_LABEL: "true",
                 EXPORT_ID_LABEL: export_id,
+                EXPORT_KIND_LABEL: kind,
                 "app.kubernetes.io/name": "dsh-world-export",
             },
         },
@@ -71,6 +80,9 @@ def export_pod_manifest(namespace: str, export_id: str, claim: str, image: str) 
                     "image": image,
                     "imagePullPolicy": "IfNotPresent",
                     "command": ["sleep", str(POD_DEADLINE_SECONDS)],
+                    # llvmpipe would start one thread per node CPU under a
+                    # 500m limit (RFC 0034 §4); the export image ignores it.
+                    "env": [{"name": "LP_NUM_THREADS", "value": "1"}],
                     "securityContext": {
                         "allowPrivilegeEscalation": False,
                         "readOnlyRootFilesystem": True,
@@ -184,4 +196,46 @@ def extract_export(archive: Path, dest: Path) -> list[str]:
     for required in ("summary.json", "world.zip", "preview/index.json"):
         if required not in written:
             raise UnsafeArchive(f"the export is missing {required}")
+    return written
+
+
+def _looks_like(name: str, head: bytes) -> bool:
+    if name == "thumb.webp":
+        return head[:4] == b"RIFF" and head[8:12] == b"WEBP"
+    if name == "poster.png":
+        return head[:8] == b"\x89PNG\r\n\x1a\n"
+    return head[:1] == b"{"
+
+
+def extract_thumbnail(archive: Path, dest: Path) -> list[str]:
+    """Unpack a thumbnail run's tar (RFC 0034) into ``dest``: exactly
+    ``thumb.webp``, ``poster.png`` and ``thumbnail.json``, regular files, each
+    of the type its name says, within a small size budget. Anything else is
+    refused, never written."""
+    dest.mkdir(parents=True, exist_ok=True)
+    written: list[str] = []
+    total = 0
+    try:
+        with tarfile.open(archive, mode="r:gz") as tar:
+            for count, member in enumerate(tar, start=1):
+                if count > len(THUMBNAIL_FILES):
+                    raise UnsafeArchive("too many files")
+                name = member.name.removeprefix("./")
+                if not member.isfile() or name not in THUMBNAIL_FILES or name in written:
+                    raise UnsafeArchive(f"unexpected entry {member.name!r}")
+                total += member.size
+                if total > MAX_THUMBNAIL_BYTES:
+                    raise UnsafeArchive("the picture is larger than allowed")
+                src = tar.extractfile(member)
+                assert src is not None
+                data = src.read(MAX_THUMBNAIL_BYTES + 1)
+                if not _looks_like(name, data[:16]):
+                    raise UnsafeArchive(f"{name} is not what its name says")
+                (dest / name).write_bytes(data)
+                written.append(name)
+    except (tarfile.TarError, EOFError, OSError) as exc:
+        raise UnsafeArchive(f"the picture could not be read: {exc}") from exc
+    for required in THUMBNAIL_FILES:
+        if required not in written:
+            raise UnsafeArchive(f"the picture is missing {required}")
     return written

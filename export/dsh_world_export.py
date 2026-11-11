@@ -16,11 +16,16 @@ world volume **read-only** at ``/mcserver`` and has an ``emptyDir`` at
 5. writes a gzipped tar of ``world.zip``, ``summary.json`` and ``preview/`` to
    stdout. Progress goes to stderr as ``phase=<name>`` lines.
 
+With ``--thumbnail`` (RFC 0034) steps 1-4 run on a fixed small box around
+spawn (no tiles), then ``mc-usd-thumbnail`` draws a turntable of it with Strata,
+headless; only ``thumb.webp``, ``poster.png`` and ``thumbnail.json`` leave the
+pod. That mode needs the thumbnail image (``Dockerfile.thumbnail``).
+
 It never writes under ``/mcserver`` and never talks to the network or the game.
 Standard library only, so the pure parts are testable without ``usd-core``.
 
 Exit status: 0 success; 2 invalid request; 3 world not found or unreadable
-for the snapshot; 1 the exporter or the tiler failed.
+for the snapshot; 1 the exporter, the tiler or the thumbnail renderer failed.
 """
 
 from __future__ import annotations
@@ -377,7 +382,25 @@ def write_tar(out: Path, stream) -> None:
                 tar.add(path, arcname=f"preview/{path.name}", recursive=False)
 
 
-def export(args: argparse.Namespace, stream) -> dict:
+@dataclass
+class Exported:
+    """A snapshot exported to USD under ``out/usd``, and what is known about it."""
+
+    area: Area
+    custom: bool
+    spawn: tuple[int, int] | None
+    kind: str
+    snap: dict
+    exporter: dict
+    out: Path
+    usd_dir: Path
+    scrub: tuple[str, ...]
+    started: float
+
+
+def snapshot_and_export(args: argparse.Namespace, default_size: int) -> Exported:
+    """Steps 1-4 up to the USD: find the world, resolve the box (``--area``,
+    else ``default_size`` around spawn), snapshot it and run the exporter."""
     started = time.monotonic()
     mcserver, work = Path(args.mcserver), Path(args.work)
     phase("copying")
@@ -391,7 +414,7 @@ def export(args: argparse.Namespace, stream) -> dict:
         custom = True
     else:
         sx, sz = spawn or (0, 0)
-        area = Area.around(sx, sz, args.default_size)
+        area = Area.around(sx, sz, default_size)
         custom = False
     if area.width > args.max_size or area.depth > args.max_size:
         raise RequestError(f"the area is larger than {args.max_size} × {args.max_size} blocks")
@@ -405,7 +428,7 @@ def export(args: argparse.Namespace, stream) -> dict:
     out = work / "out"
     if out.exists():
         shutil.rmtree(out)
-    usd_dir, preview = out / "usd", out / "preview"
+    usd_dir = out / "usd"
     usd_dir.mkdir(parents=True)
     scrub = (str(snap_world), str(world))
 
@@ -432,6 +455,13 @@ def export(args: argparse.Namespace, stream) -> dict:
         scrub,
     )
     exporter = json.loads(exporter_summary.read_text(encoding="utf-8"))
+    return Exported(area, custom, spawn, kind, snap, exporter, out, usd_dir, scrub, started)
+
+
+def export(args: argparse.Namespace, stream) -> dict:
+    done = snapshot_and_export(args, args.default_size)
+    out, usd_dir, scrub, area = done.out, done.usd_dir, done.scrub, done.area
+    preview = out / "preview"
 
     phase("preview")
     tiler = [args.tiler, "tiles", str(usd_dir / "terrain.usdc"), "-o", str(preview), "--replace"]
@@ -445,20 +475,112 @@ def export(args: argparse.Namespace, stream) -> dict:
     zip_bytes = write_zip(usd_dir, out / "world.zip", area)
     summary = build_summary(
         area=area,
-        custom_area=custom,
-        spawn=spawn,
-        kind=kind,
-        snap=snap,
-        exporter=exporter,
+        custom_area=done.custom,
+        spawn=done.spawn,
+        kind=done.kind,
+        snap=done.snap,
+        exporter=done.exporter,
         zip_bytes=zip_bytes,
         preview_bytes=preview_bytes,
-        seconds=time.monotonic() - started,
+        seconds=time.monotonic() - done.started,
         scrub=scrub,
     )
     (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     write_tar(out, stream)
     phase("done")
     return summary
+
+
+# ---------------------------------------------------------------------------
+# --thumbnail (RFC 0034)
+# ---------------------------------------------------------------------------
+
+THUMBNAIL_FILES = ("thumb.webp", "poster.png")
+THUMBNAILER_EXIT_STRATA = 3  # mc-usd-thumbnail: Strata, EGL or Mesa could not be loaded
+
+
+def run_thumbnailer(argv: list[str], scrub: tuple[str, ...]) -> None:
+    """Run ``mc-usd-thumbnail``. Its last stderr line goes to stderr as
+    ``detail:`` for the operator's log; the ``error:`` the owner reads is fixed."""
+    proc = subprocess.run(argv, capture_output=True, text=True, check=False)
+    if proc.returncode == 0:
+        return
+    lines = [ln for ln in (proc.stderr or proc.stdout).strip().splitlines() if ln.strip()]
+    last = _scrub(lines[-1], *scrub)[:300] if lines else f"exit status {proc.returncode}"
+    print(f"detail: {last}", file=sys.stderr, flush=True)
+    if proc.returncode != THUMBNAILER_EXIT_STRATA and "blank" in last:
+        raise StepError("the picture came out blank; is there anything built around spawn?")
+    raise StepError("the picture could not be drawn")
+
+
+def build_thumbnail_meta(done: Exported, render: dict, seconds: float) -> dict:
+    """The fields of thumbnail.json, chosen one by one, like build_summary."""
+    size = render.get("size")
+    sizes = render.get("bytes") if isinstance(render.get("bytes"), dict) else {}
+    strata = render.get("strata")
+    return {
+        "version": 1,
+        "area": done.area.as_dict(),
+        "spawn": {"x": done.spawn[0], "z": done.spawn[1]} if done.spawn else None,
+        "snapshot": done.kind,
+        "snapshot_attempts": done.snap["attempts"],
+        "exporter_commit": os.environ.get("EXPORTER_PIN"),
+        "strata": strata[:32] if isinstance(strata, str) else None,
+        "frames": render.get("frames") if isinstance(render.get("frames"), int) else None,
+        "size": [int(v) for v in size][:2] if isinstance(size, list) else None,
+        "ms": render.get("ms") if isinstance(render.get("ms"), int) else None,
+        "bytes": {n: sizes.get(n) for n in THUMBNAIL_FILES if isinstance(sizes.get(n), int)},
+        "stats": {
+            "instances": done.exporter.get("instances"),
+            "render_seconds": render.get("s_total"),
+            "seconds": round(seconds, 2),
+        },
+    }
+
+
+def write_thumbnail_tar(thumb_dir: Path, stream) -> None:
+    """A gzipped tar of thumb.webp, poster.png and thumbnail.json to ``stream``."""
+    with tarfile.open(fileobj=stream, mode="w|gz") as tar:
+        for name in (*THUMBNAIL_FILES, "thumbnail.json"):
+            tar.add(thumb_dir / name, arcname=name, recursive=False)
+
+
+def thumbnail(args: argparse.Namespace, stream) -> dict:
+    done = snapshot_and_export(args, args.thumbnail_size)
+    phase("thumbnail")
+    thumb_dir = done.out / "thumbnail"
+    stats_path = done.out / "thumbnail-stats.json"
+    w, h = args.thumbnail_px
+    run_thumbnailer(
+        [
+            args.thumbnailer,
+            str(done.usd_dir / "world.usda"),
+            str(thumb_dir),
+            "--frames",
+            str(args.thumbnail_frames),
+            "--size",
+            str(w),
+            str(h),
+            "--ms",
+            str(args.thumbnail_ms),
+            "--stats-json",
+            str(stats_path),
+        ],  # fmt: skip
+        done.scrub,
+    )
+    for name in THUMBNAIL_FILES:
+        if not (thumb_dir / name).is_file():
+            raise StepError("the picture could not be drawn")
+    try:
+        render = json.loads(stats_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        render = {}
+    phase("packaging")
+    meta = build_thumbnail_meta(done, render, time.monotonic() - done.started)
+    (thumb_dir / "thumbnail.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    write_thumbnail_tar(thumb_dir, stream)
+    phase("done")
+    return meta
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -472,6 +594,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--title", default="world")
     p.add_argument("--exporter", default="mc-usd-export")
     p.add_argument("--tiler", default="usd-web")
+    p.add_argument("--thumbnail", action="store_true", help="draw a turntable thumbnail (RFC 0034)")
+    p.add_argument("--thumbnail-size", type=int, default=128, help="box around spawn, in blocks")
+    p.add_argument("--thumbnail-frames", type=int, default=12)
+    p.add_argument("--thumbnail-px", type=int, nargs=2, default=[200, 132], metavar=("W", "H"))
+    p.add_argument("--thumbnail-ms", type=int, default=250)
+    p.add_argument("--thumbnailer", default="mc-usd-thumbnail")
     return p
 
 
@@ -480,10 +608,19 @@ def main(argv: list[str] | None = None, stream=None) -> int:
     if args.default_size < 16 or args.default_size > args.max_size:
         print("error: --default-size must be between 16 and --max-size", file=sys.stderr)
         return 2
+    if args.thumbnail and args.area:
+        print("error: --thumbnail always draws the box around spawn", file=sys.stderr)
+        return 2
+    if args.thumbnail and not 16 <= args.thumbnail_size <= 256:
+        print("error: --thumbnail-size must be between 16 and 256", file=sys.stderr)
+        return 2
+    if args.thumbnail and not 1 <= args.thumbnail_frames <= 48:
+        print("error: --thumbnail-frames must be between 1 and 48", file=sys.stderr)
+        return 2
     if stream is None:
         stream = sys.stdout.buffer
     try:
-        export(args, stream)
+        (thumbnail if args.thumbnail else export)(args, stream)
     except RequestError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -503,6 +640,7 @@ if __name__ == "__main__":  # pragma: no cover
 __all__ = [
     "Area",
     "build_summary",
+    "build_thumbnail_meta",
     "main",
     "read_level_name",
     "read_spawn",

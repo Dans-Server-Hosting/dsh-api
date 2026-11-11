@@ -9,7 +9,7 @@
 FROM python:3.12-slim
 
 # Both pin usd-core==26.8. Move a pin deliberately, like OMCSI_PIN in ../Dockerfile.
-ARG EXPORTER_PIN=ab4d4bdc838e25f18c4a0c98dbe3992c1a91efd3
+ARG EXPORTER_PIN=22caa3dc021d7b4eba315501443f2cc9e4992a93
 ARG USD_WEB_PIN=418892dae443f3291a34bf6fc7da0ca53d6b2ec8
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \

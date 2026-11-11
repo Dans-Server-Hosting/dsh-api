@@ -72,6 +72,17 @@ CREATE TABLE IF NOT EXISTS world_exports (
 );
 CREATE INDEX IF NOT EXISTS world_exports_server ON world_exports(server);
 CREATE INDEX IF NOT EXISTS world_exports_tenant ON world_exports(tenant_id, created_at);
+CREATE TABLE IF NOT EXISTS world_thumbnails (
+    server TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    run_id TEXT,
+    status TEXT NOT NULL,
+    phase TEXT,
+    error TEXT,
+    requested_at TEXT NOT NULL,
+    rendered_at TEXT,
+    meta TEXT
+);
 CREATE TABLE IF NOT EXISTS server_plugin_state (
     server TEXT PRIMARY KEY,
     seeded_at TEXT NOT NULL,
@@ -92,6 +103,10 @@ or that a DELETE was accepted and its steps are still running."""
 
 EXPORT_REQUESTED = "export.requested"
 """The event of an accepted export; what the daily limit counts."""
+
+THUMBNAIL_REQUESTED = "thumbnail.requested"
+"""The event of an accepted thumbnail run (RFC 0034); what its per-server
+daily limit counts."""
 
 
 def now_iso() -> str:
@@ -168,6 +183,29 @@ def _export_row(row: sqlite3.Row) -> ExportRow:
     data["custom_area"] = bool(data["custom_area"])
     data["stats"] = json.loads(data["stats"]) if data["stats"] else None
     return ExportRow(**data)
+
+
+@dataclass(frozen=True)
+class ThumbnailRow:
+    """A server's one thumbnail (RFC 0034): the state of its latest run, and
+    ``rendered_at``/``meta`` of the picture on disk, if any (a failed run
+    keeps the previous picture)."""
+
+    server: str
+    tenant_id: str
+    run_id: str | None
+    status: str
+    phase: str | None
+    error: str | None
+    requested_at: str
+    rendered_at: str | None
+    meta: dict | None
+
+
+def _thumbnail_row(row: sqlite3.Row) -> ThumbnailRow:
+    data = dict(row)
+    data["meta"] = json.loads(data["meta"]) if data["meta"] else None
+    return ThumbnailRow(**data)
 
 
 @dataclass(frozen=True)
@@ -328,6 +366,7 @@ class Database:
             conn.execute("DELETE FROM servers WHERE name = ?", (name,))
             conn.execute("DELETE FROM server_plugins WHERE server = ?", (name,))
             conn.execute("DELETE FROM server_plugin_state WHERE server = ?", (name,))
+            conn.execute("DELETE FROM world_thumbnails WHERE server = ?", (name,))
 
     # --- plugin selection ----------------------------------------------------
 
@@ -614,3 +653,92 @@ class Database:
             ]
             conn.execute("DELETE FROM world_exports WHERE server = ?", (server,))
         return ids
+
+    # --- world thumbnails (RFC 0034) ------------------------------------------
+
+    def get_thumbnail(self, server: str) -> ThumbnailRow | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM world_thumbnails WHERE server = ?", (server,)
+            ).fetchone()
+        return _thumbnail_row(row) if row else None
+
+    def reserve_thumbnail(
+        self, server: str, tenant_id: str, run_id: str, daily_limit: int, window: timedelta
+    ) -> ThumbnailRow | None:
+        """Mark the server's thumbnail ``queued`` for ``run_id`` and record the
+        event that counts it, together. None (nothing written) when a run is
+        already queued or running, or the server has had ``daily_limit`` runs
+        within ``window``. The picture on disk, if any, is kept."""
+        since = _iso(datetime.now(UTC) - window)
+        at = now_iso()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO world_thumbnails (server, tenant_id, run_id, status, requested_at)"
+                " SELECT ?, ?, ?, 'queued', ?"
+                " WHERE (SELECT COUNT(*) FROM events WHERE tenant_id = ? AND server_name = ?"
+                "        AND kind = ? AND at > ?) < ?"
+                " ON CONFLICT(server) DO UPDATE SET tenant_id = excluded.tenant_id,"
+                "  run_id = excluded.run_id, status = 'queued', phase = NULL, error = NULL,"
+                "  requested_at = excluded.requested_at"
+                " WHERE world_thumbnails.status NOT IN ('queued', 'running')",
+                (
+                    server,
+                    tenant_id,
+                    run_id,
+                    at,
+                    tenant_id,
+                    server,
+                    THUMBNAIL_REQUESTED,
+                    since,
+                    daily_limit,
+                ),
+            )
+            if cur.rowcount != 1:
+                return None
+            self._insert_event(conn, tenant_id, server, THUMBNAIL_REQUESTED, run_id)
+        return self.get_thumbnail(server)
+
+    def count_thumbnails_since(
+        self, tenant_id: str, server: str, window: timedelta
+    ) -> tuple[int, str | None]:
+        """Runs of this server's thumbnail within ``window``, and the oldest start."""
+        since = _iso(datetime.now(UTC) - window)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n, MIN(at) AS oldest FROM events"
+                " WHERE tenant_id = ? AND server_name = ? AND kind = ? AND at > ?",
+                (tenant_id, server, THUMBNAIL_REQUESTED, since),
+            ).fetchone()
+        return int(row["n"]), row["oldest"]
+
+    def update_thumbnail(self, server: str, run_id: str, **fields: object) -> bool:
+        """Update the row only while it still belongs to ``run_id``."""
+        allowed = {"status", "phase", "error", "rendered_at", "meta"}
+        if not fields or not set(fields) <= allowed:
+            raise ValueError(f"cannot update {sorted(set(fields) - allowed)}")
+        values = [json.dumps(v) if k == "meta" and v is not None else v for k, v in fields.items()]
+        assignments = ", ".join(f"{k} = ?" for k in fields)
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"UPDATE world_thumbnails SET {assignments} WHERE server = ? AND run_id = ?",
+                (*values, server, run_id),
+            )
+        return cur.rowcount == 1
+
+    def thumbnails_with_status(self, *statuses: str) -> list[ThumbnailRow]:
+        marks = ",".join("?" * len(statuses))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM world_thumbnails WHERE status IN ({marks})", statuses
+            ).fetchall()
+        return [_thumbnail_row(r) for r in rows]
+
+    def all_thumbnails(self) -> list[ThumbnailRow]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM world_thumbnails").fetchall()
+        return [_thumbnail_row(r) for r in rows]
+
+    def delete_thumbnail(self, server: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM world_thumbnails WHERE server = ?", (server,))
