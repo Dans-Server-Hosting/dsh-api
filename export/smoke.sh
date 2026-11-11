@@ -6,6 +6,9 @@
 #
 #   docker build -t dsh-world-export:ci export/ && export/smoke.sh dsh-world-export:ci
 #   export/smoke.sh dsh-world-export:ci dsh-world-thumbnail:ci
+#
+# With SMOKE_THUMB_OUT=DIR, the thumbnail's three files are also copied into DIR
+# (CI keeps them as the smoke-thumbnail artifact; the README shows them).
 set -euo pipefail
 image="${1:?usage: smoke.sh IMAGE [THUMBNAIL_IMAGE]}"
 thumb_image="${2:-}"
@@ -59,6 +62,10 @@ assert m["strata"] and m["exporter_commit"], m
 assert 1000 < len(webp) < 200_000, len(webp)
 print("smoke: thumbnail ok", m["bytes"], m["stats"])
 PY
+  if [ -n "${SMOKE_THUMB_OUT:-}" ]; then
+    mkdir -p "$SMOKE_THUMB_OUT"
+    cp "$out/thumb/thumb.webp" "$out/thumb/poster.png" "$out/thumb/thumbnail.json" "$SMOKE_THUMB_OUT/"
+  fi
 fi
 after="$(cd "$here/fixtures/server" && find . -type f -exec sha256sum {} + | sort)"
 [ "$before" = "$after" ] || { echo "smoke: the world changed" >&2; exit 1; }
