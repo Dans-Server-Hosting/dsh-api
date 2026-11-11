@@ -331,6 +331,73 @@ def test_statefulset_status_carries_the_pod_creation_time_as_scaled_at(tmp_path)
     assert be.statefulset_status("alpha").scaled_at is None
 
 
+@pytest.mark.parametrize(
+    "reason", ["CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull", "Error", "OOMKilled"]
+)
+def test_every_failing_wait_reason_marks_the_wrapper_failed(tmp_path, reason):
+    runner = Runner(sts(1, 1), pods(reason))
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path), run=runner)
+    status = be.statefulset_status("alpha")
+    assert status.failing is True
+    assert status.state == "failed"
+    assert runner.calls[1][0] == [
+        "kubectl", "-n", "t-alpha", "get", "pods",
+        "-l", "app.kubernetes.io/component=minecraft-wrapper", "-o", "json",
+    ]  # fmt: skip
+
+
+def test_a_failing_init_container_marks_the_wrapper_failed(tmp_path):
+    """A pod stuck before its main container starts reports the reason on
+    ``initContainerStatuses``; it is read the same way."""
+    pod = {
+        "metadata": {"creationTimestamp": "2026-09-13T10:00:00Z"},
+        "status": {
+            "phase": "Pending",
+            "containerStatuses": [{"state": {"waiting": {"reason": "PodInitializing"}}}],
+            "initContainerStatuses": [{"state": {"waiting": {"reason": "CrashLoopBackOff"}}}],
+        },
+    }
+    runner = Runner(sts(1, 0), json.dumps({"items": [pod]}))
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path), run=runner)
+    assert be.statefulset_status("alpha").state == "failed"
+
+
+def test_the_oldest_wrapper_pod_sets_scaled_at_and_a_bad_timestamp_is_skipped(tmp_path):
+    """During a restart two wrapper pods can be listed; the older one is when the
+    server was scaled up. A timestamp that does not parse is left out."""
+    items = [
+        {"metadata": {"creationTimestamp": stamp}, "status": {"phase": "Running"}}
+        for stamp in ("2026-09-13T11:00:00Z", "yesterday", "2026-09-13T10:00:00Z", None)
+    ]
+    runner = Runner(sts(1, 1), json.dumps({"items": items}))
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path), run=runner)
+    status = be.statefulset_status("alpha")
+    assert status.scaled_at == datetime(2026, 9, 13, 10, 0, tzinfo=UTC)
+    assert status.failing is False
+
+
+def test_a_statefulset_without_replica_fields_reads_as_asleep(tmp_path):
+    runner = Runner(json.dumps({}))
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path), run=runner)
+    status = be.statefulset_status("alpha")
+    assert (status.exists, status.replicas, status.ready_replicas) == (True, 0, 0)
+    assert status.state == "asleep"
+    assert len(runner.calls) == 1  # no pods to read at zero replicas
+
+
+def test_statefulset_status_not_found_is_gone_and_other_errors_propagate(tmp_path):
+    gone = ClusterError(
+        "kubectl -n failed: Error from server (NotFound): "
+        'statefulsets.apps "alpha-omcsi-minecraft-wrapper" not found'
+    )
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path), run=Runner(gone))
+    assert be.statefulset_status("alpha").exists is False
+    forbidden = ClusterError("kubectl -n failed: Error from server (Forbidden): forbidden")
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path), run=Runner(forbidden))
+    with pytest.raises(ClusterError, match="Forbidden"):
+        be.statefulset_status("alpha")
+
+
 # --- the wrapper's own API ----------------------------------------------------
 
 
@@ -383,6 +450,17 @@ def test_wrapper_status_reports_a_stopped_game(tmp_path):
 def test_wrapper_status_is_none_unless_the_wrapper_answers_properly(tmp_path, answer):
     be = KubectlHelmBackend("/opt/omcsi", str(tmp_path), http=Http(answer))
     assert be.wrapper_status("alpha") is None
+
+
+def test_wrapper_status_coerces_numbers_and_the_start_time():
+    """Numbers arrive as JSON numbers of either kind and are kept as whole
+    seconds; anything else in a numeric field is dropped, not an error."""
+    floats = {"running": True, "pid": 42.0, "uptimeSeconds": 9.9, "startedAt": 1700000000}
+    expected = WrapperStatus(running=True, pid=42, uptime_seconds=9, started_at="1700000000")
+    assert WrapperStatus.from_json(floats) == expected
+    strings = {"running": True, "pid": "42", "uptimeSeconds": "long"}
+    assert WrapperStatus.from_json(strings) == WrapperStatus(running=True)
+    assert WrapperStatus.from_json({"running": False}) == WrapperStatus(running=False)
 
 
 def test_start_wrapper_posts_to_the_start_endpoint(tmp_path):
