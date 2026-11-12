@@ -29,9 +29,11 @@ driven through the public API (see the MVP done-when list).
   people said about the portal, for the admins), `server_plugins` /
   `server_plugin_state` (each server's plugin selection, and the hashes of
   the selection last written to its ConfigMap and the one the wrapper last
-  reported applying at boot), and `world_exports` (each world export's
+  reported applying at boot), `world_exports` (each world export's
   status, box, snapshot kind and expiry; the files themselves are under
-  `DSH_EXPORT_DIR`). Once a server is created the
+  `DSH_EXPORT_DIR`) and `world_thumbnails` (each server's one thumbnail:
+  its last run's status and the picture's render time and metadata; the
+  pictures are under `DSH_EXPORT_DIR/.thumbnails`). Once a server is created the
   cluster is the source of truth for whether it exists and what state it is
   in: the wrapper StatefulSet says whether the pod is up, and the wrapper's
   own API (`/api/server/status` on its internal Service, port 8092) says
@@ -77,7 +79,7 @@ never fails a list or get.
 | Method | Path | Notes |
 |---|---|---|
 | `GET` | `/healthz` | liveness |
-| `GET` | `/api/v1/limits` | free-tier profile as numbers, plus the world-export limits (`export_default_size`, `export_max_size`, `export_daily_limit`, `export_retention_hours`); no token needed |
+| `GET` | `/api/v1/limits` | `servers_per_tenant` and the free-tier profile as numbers, plus the world-export limits (`export_default_size`, `export_max_size`, `export_daily_limit`, `export_retention_hours`) and the thumbnail settings (`thumbnail_mode`: `off` or `manual`, `thumbnail_daily_limit`); no token needed |
 | `GET` | `/api/v1/default-plugins` | the plugins every new server is installed with, in install order (`name`, `version`, `description`, `download_url`, `project_url`); no token needed |
 | `GET` | `/api/v1/servers` | the caller's servers |
 | `POST` | `/api/v1/servers` | `{name, motd?, operator_username?}` → **202** with the server in state `provisioning`; the admin password is in this response **only**. `name` is 2–31 lowercase letters, digits and dashes, starting with a letter and not ending in a dash, and may not contain `omcsi` (422 otherwise). 409 `{"detail": "a server is already being created for this account", "server": "<name>"}` while the caller's earlier create is still running; 409 when the name is taken; 403 at the tenant cap; 422 when `operator_username` cannot be resolved, including when Mojang cannot be reached |
