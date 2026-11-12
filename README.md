@@ -297,6 +297,16 @@ the portal takes as "hide the section". While it is on:
 
 ## World thumbnails (RFC 0034)
 
+![A small forested patch of a Minecraft world with a pond, turning once as the camera circles it](docs/images/fixture-thumbnail.webp)
+
+*The thumbnail CI's `thumbnail-image` job draws from the committed fixture
+server (`export/fixtures/server`, four chunks of a fresh vanilla 26.3 world):
+`dsh-world-export --thumbnail` in the thumbnail image, run the way the pod runs
+it, with the defaults (12 frames, 200 × 132, 250 ms each; 34.5 KB WebP, and a
+6.2 KB [poster](docs/images/fixture-thumbnail-poster.png) for reduced motion).
+`SMOKE_THUMB_OUT=DIR export/smoke.sh EXPORT_IMAGE THUMBNAIL_IMAGE` writes the
+same three files to `DIR`; CI keeps them as the `smoke-thumbnail` artifact.*
+
 Off until `DSH_WORLD_THUMBNAILS=manual`; every route answers 503 until then,
 which the portal takes as "no picture". `GET /api/v1/limits` reports
 `thumbnail_mode` (`off` or `manual`) so the portal knows whether to offer

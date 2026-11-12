@@ -45,3 +45,10 @@ jobs:
       - run: docker build -t dsh-world-thumbnail:ci --build-arg BASE=dsh-world-export:ci -f export/Dockerfile.thumbnail export/
       - run: docker image ls --format '{{.Repository}}:{{.Tag}} {{.Size}}' | grep dsh-world
       - run: export/smoke.sh dsh-world-export:ci dsh-world-thumbnail:ci
+        env:
+          SMOKE_THUMB_OUT: smoke-thumbnail
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smoke-thumbnail
+          path: smoke-thumbnail/
+          if-no-files-found: error
