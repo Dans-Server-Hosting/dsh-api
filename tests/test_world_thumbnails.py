@@ -373,6 +373,94 @@ def test_orphaned_folders_and_rows_are_swept(api, alpha, export_jobs, db, tmp_pa
     assert not (thumbs_dir(tmp_path) / "alpha").exists()
 
 
+def test_a_picture_whose_server_changed_hands_is_swept(api, alpha, export_jobs, db, tmp_path):
+    ready(api, export_jobs)
+    db.ensure_tenant("bob")
+    with db._connect() as conn:  # the name now belongs to someone else; the row is stale
+        conn.execute("UPDATE servers SET tenant_id = 'bob' WHERE name = 'alpha'")
+    assert api.app.state.thumbnails.sweep() == 1
+    assert db.get_thumbnail("alpha") is None
+    assert not (thumbs_dir(tmp_path) / "alpha").exists()
+
+
+def test_a_run_in_flight_is_not_swept_and_fails_once_its_server_is_gone(
+    api, alpha, export_jobs, db, cluster, tmp_path
+) -> None:
+    ready(api, export_jobs)
+    assert refresh(api).status_code == 202  # queued again; the old picture stays meanwhile
+    with db._connect() as conn:  # the server row went, the thumbnail row did not
+        conn.execute("DELETE FROM servers WHERE name = 'alpha'")
+    sweep = api.app.state.thumbnails.sweep
+    assert sweep() == 0
+    assert db.get_thumbnail("alpha").status == "queued"
+    assert (thumbs_dir(tmp_path) / "alpha" / "thumb.webp").is_file()
+
+    assert export_jobs.run() == 1
+    row = db.get_thumbnail("alpha")
+    assert row.status == "failed" and row.error == "the server was deleted"
+    assert len(cluster.thumbnails_run) == 1  # no pod for the second run
+    assert sweep() == 1  # finished now, so it goes
+    assert not (thumbs_dir(tmp_path) / "alpha").exists()
+
+
+def test_a_stray_file_is_swept_and_dot_folders_are_left(api, alpha, export_jobs, tmp_path):
+    ready(api, export_jobs)
+    root = thumbs_dir(tmp_path)
+    (root / "stray.webp").write_bytes(WEBP)
+    (root / ".staging").mkdir(exist_ok=True)
+    assert api.app.state.thumbnails.sweep() == 1
+    assert not (root / "stray.webp").exists()
+    assert (root / ".staging").is_dir()
+    assert (root / "alpha" / "thumb.webp").is_file()
+
+
+def test_a_picture_missing_from_disk_is_not_served(api, alpha, export_jobs, tmp_path) -> None:
+    ready(api, export_jobs)
+    (thumbs_dir(tmp_path) / "alpha" / "poster.png").unlink()
+    assert api.get(f"{URL}/poster.png", headers=ALICE).status_code == 404
+    assert api.get(f"{URL}/thumb.webp", headers=ALICE).status_code == 200
+    view = api.get(URL, headers=ALICE).json()
+    assert view["has_picture"] is False and view["rendered_at"] is None
+
+
+def test_a_server_deleted_while_its_picture_is_drawn_keeps_nothing(
+    api, alpha, export_jobs, cluster, db, tmp_path
+) -> None:
+    real = cluster.run_world_thumbnail
+
+    def then_delete(name, run_id, **kw):
+        real(name, run_id, **kw)
+        db.delete_server(name)
+
+    cluster.run_world_thumbnail = then_delete
+    assert refresh(api).status_code == 202
+    export_jobs.run()
+    assert db.get_thumbnail("alpha") is None
+    assert not (thumbs_dir(tmp_path) / "alpha").exists()
+    events = db.events("alpha")
+    failed = [e["detail"] for e in events if e["kind"] == "thumbnail.failed"]
+    assert len(failed) == 1 and failed[0].endswith(": the server was deleted")
+    assert "thumbnail.ready" not in [e["kind"] for e in events]
+
+
+def test_a_row_gone_while_the_files_moved_takes_the_files_with_it(
+    api, alpha, export_jobs, cluster, db, tmp_path
+) -> None:
+    real = cluster.run_world_thumbnail
+
+    def then_forget(name, run_id, **kw):
+        real(name, run_id, **kw)
+        db.delete_thumbnail(name)  # what the delete hook does to the row
+
+    cluster.run_world_thumbnail = then_forget
+    assert refresh(api).status_code == 202
+    export_jobs.run()
+    assert db.get_thumbnail("alpha") is None
+    assert not (thumbs_dir(tmp_path) / "alpha").exists()
+    kinds = [e["kind"] for e in db.events("alpha")]
+    assert "thumbnail.ready" not in kinds and "thumbnail.failed" not in kinds
+
+
 def test_a_restart_fails_interrupted_runs_and_removes_their_pods(make_app, alpha, cluster):
     api = make_app()
     assert refresh(api).status_code == 202  # queued, never run: the process "died"
@@ -380,6 +468,19 @@ def test_a_restart_fails_interrupted_runs_and_removes_their_pods(make_app, alpha
     view = api.get(URL, headers=ALICE).json()
     assert view["status"] == "failed" and "interrupted" in view["error"]
     assert ("delete_world_export_pods", "alpha") in cluster.ops
+
+
+def test_a_restart_still_starts_when_the_pods_cannot_be_removed(make_app, alpha, cluster):
+    api = make_app()
+    assert refresh(api).status_code == 202
+
+    def refuse(name):
+        raise ClusterError("the cluster cannot be reached")
+
+    cluster.delete_world_export_pods = refuse
+    make_app()  # the next process starts regardless
+    view = api.get(URL, headers=ALICE).json()
+    assert view["status"] == "failed" and "interrupted" in view["error"]
 
 
 def test_settings_come_from_the_environment() -> None:
