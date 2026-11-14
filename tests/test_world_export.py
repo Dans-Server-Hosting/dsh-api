@@ -786,6 +786,80 @@ def test_a_pod_that_never_starts_is_explained_and_deleted(tmp_path) -> None:
     assert "delete pod world-export-0123456789ab" in " ".join(run.calls[-1][0])
 
 
+PULL_BACKOFF = {"containerStatuses": [{"state": {"waiting": {"reason": "ImagePullBackOff"}}}]}
+NEVER_PULL = {"containerStatuses": [{"state": {"waiting": {"reason": "ErrImageNeverPull"}}}]}
+UNSCHEDULABLE = {"conditions": [{"type": "PodScheduled", "reason": "Unschedulable"}]}
+CREATING = {"containerStatuses": [{"state": {"waiting": {"reason": "ContainerCreating"}}}]}
+RUNNING = {"containerStatuses": [{"state": {"running": {}}}]}
+NO_ROOM = "the server has no room for an export right now; try again later"
+NOT_FOUND = ClusterError('pods "world-export-0123456789ab" not found')
+NO_IMAGE = "the export image is not available on the cluster"
+
+
+@pytest.mark.parametrize(
+    ("pod_answer", "message"),
+    [
+        (json.dumps({"status": PULL_BACKOFF}), NO_IMAGE),
+        (json.dumps({"status": NEVER_PULL}), NO_IMAGE),
+        (json.dumps({"status": UNSCHEDULABLE}), NO_ROOM),
+        (json.dumps({"status": CREATING}), "the export pod did not start in time"),
+        (json.dumps({"status": RUNNING}), "the export pod did not start in time"),
+        (json.dumps({}), "the export pod did not start in time"),
+        ("not json", "the export could not be started"),
+        (NOT_FOUND, "the export could not be started"),
+    ],
+)
+def test_why_a_pod_never_started_is_told_in_the_owners_terms(tmp_path, pod_answer, message):
+    run = Runner(
+        {
+            "wait --for": ClusterError("timed out waiting for the condition"),
+            "get pod world-export": pod_answer,
+        }
+    )
+    with pytest.raises(ClusterError) as caught:
+        go(backend(run, Stream(b""), tmp_path), tmp_path / "d")
+    assert str(caught.value) == message
+    assert "delete pod world-export-0123456789ab" in " ".join(run.calls[-1][0])
+
+
+def test_a_pull_failure_is_named_before_an_unschedulable_condition(tmp_path) -> None:
+    both = {"status": {**PULL_BACKOFF, **UNSCHEDULABLE}}
+    run = Runner(
+        {
+            "wait --for": ClusterError("timed out waiting for the condition"),
+            "get pod world-export": json.dumps(both),
+        }
+    )
+    with pytest.raises(ClusterError, match="image is not available"):
+        go(backend(run, Stream(b""), tmp_path), tmp_path / "d")
+
+
+def test_a_refused_pod_that_is_not_a_quota_keeps_the_clusters_words(tmp_path) -> None:
+    def apply_pod(argv, *, stdin=None, stdout_path=None):
+        if stdin and '"kind": "Pod"' in stdin:
+            raise ClusterError("admission webhook denied the request")
+        return ""
+
+    with pytest.raises(ClusterError) as caught:
+        go(KubectlHelmBackend("/o", str(tmp_path), run=apply_pod), tmp_path / "d")
+    assert str(caught.value) == "admission webhook denied the request"
+
+
+def test_a_pod_that_will_not_be_deleted_does_not_fail_the_export(tmp_path) -> None:
+    run = Runner({"delete pod world-export": ClusterError("the server is currently unavailable")})
+    go(backend(run, Stream(make_tar(GOOD)), tmp_path), tmp_path / "dest")
+    assert "delete pod world-export-0123456789ab" in " ".join(run.calls[-1][0])
+    assert (tmp_path / "dest" / "world.zip").read_bytes() == b"PK"
+
+
+def test_a_failed_delete_does_not_hide_why_the_run_failed(tmp_path) -> None:
+    run = Runner({"delete pod world-export": ClusterError("the server is currently unavailable")})
+    stream = Stream(b"", code=3, stderr=["error: the world has not been created yet"])
+    with pytest.raises(ClusterError) as caught:
+        go(backend(run, stream, tmp_path), tmp_path / "d")
+    assert str(caught.value) == "the world has not been created yet"
+
+
 @pytest.mark.parametrize(
     ("code", "stderr", "message"),
     [
