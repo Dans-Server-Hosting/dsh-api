@@ -602,6 +602,33 @@ def test_a_full_quota_is_explained_for_a_picture(tmp_path) -> None:
         go(flaky, Stream(b""), tmp_path)
 
 
+PULL_BACKOFF = {"containerStatuses": [{"state": {"waiting": {"reason": "ImagePullBackOff"}}}]}
+UNSCHEDULABLE = {"conditions": [{"type": "PodScheduled", "reason": "Unschedulable"}]}
+NO_ROOM = "the server has no room for drawing its picture right now; try again later"
+
+
+@pytest.mark.parametrize(
+    ("pod_answer", "message"),
+    [
+        (json.dumps({"status": PULL_BACKOFF}), "the picture image is not available on the cluster"),
+        (json.dumps({"status": UNSCHEDULABLE}), NO_ROOM),
+        (json.dumps({}), "the picture pod did not start in time"),
+        ("not json", "the picture could not be started"),
+    ],
+)
+def test_a_picture_pod_that_never_starts_is_told_as_a_picture(tmp_path, pod_answer, message):
+    run = Runner(
+        {
+            "wait --for": ClusterError("timed out waiting for the condition"),
+            "get pod world-export": pod_answer,
+        }
+    )
+    with pytest.raises(ClusterError) as caught:
+        go(run, Stream(b""), tmp_path)
+    assert str(caught.value) == message
+    assert "delete pod world-export-0123456789ab" in " ".join(run.calls[-1][0])
+
+
 @pytest.mark.parametrize(
     ("code", "stderr", "message"),
     [
