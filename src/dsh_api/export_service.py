@@ -140,7 +140,7 @@ class ExportService:
 
     def _owned_export(self, tenant_id: str, name: str, export_id: str) -> ExportRow:
         self.servers.owned(tenant_id, name)
-        row = self.db.get_export(export_id) if EXPORT_ID_RE.match(export_id) else None
+        row = self.db.get_export(export_id) if EXPORT_ID_RE.fullmatch(export_id) else None
         if row is None or row.server != name or row.tenant_id != tenant_id:
             raise ExportNotFound(export_id)
         if _expired(row, datetime.now(UTC)):  # the sweep has just not got to it yet
@@ -175,7 +175,7 @@ class ExportService:
     def preview_file(self, tenant_id: str, name: str, export_id: str, file: str) -> Path:
         self._require_enabled()
         row = self._owned_export(tenant_id, name, export_id)
-        if row.status != "ready" or not PREVIEW_FILE_RE.match(file):
+        if row.status != "ready" or not PREVIEW_FILE_RE.fullmatch(file):
             raise ExportNotFound(export_id)
         path = self._dir(name, export_id) / "preview" / file
         if not path.is_file():
@@ -257,7 +257,7 @@ class ExportService:
         expected = hmac.new(self._link_key, payload, hashlib.sha256).digest()
         if not hmac.compare_digest(mac, expected) or expires_at < datetime.now(UTC).timestamp():
             raise ExportNotFound("link")
-        row = self.db.get_export(export_id) if EXPORT_ID_RE.match(export_id) else None
+        row = self.db.get_export(export_id) if EXPORT_ID_RE.fullmatch(export_id) else None
         if row is None or row.server != server or row.status != "ready":
             raise ExportNotFound("link")
         if _expired(row, datetime.now(UTC)):
