@@ -524,6 +524,35 @@ def test_bad_expired_or_stale_links_are_404(api, alpha, export_jobs) -> None:
     assert api.get(f"/api/v1/export-downloads/{good}").status_code == 404
 
 
+NEWLINE_ID = "0123456789ab\n"
+
+
+def test_an_export_id_with_a_trailing_newline_is_404(api, alpha, db) -> None:
+    # A row the guard should never let a lookup reach, so a pass would show.
+    db.insert_export(NEWLINE_ID, "alpha", "alice", None)
+    resp = api.get("/api/v1/servers/alpha/exports/0123456789ab%0A", headers=ALICE)
+    assert resp.status_code == 404
+
+
+def test_a_preview_file_with_a_trailing_newline_is_404(api, alpha, export_jobs, tmp_path) -> None:
+    export = ready_export(api, export_jobs)
+    preview = tmp_path / "exports" / "alpha" / export["id"] / "preview"
+    (preview / "index.json\n").write_bytes(b"{}")
+    base = f"/api/v1/servers/alpha/exports/{export['id']}/preview"
+    assert api.get(f"{base}/index.json%0A", headers=ALICE).status_code == 404
+    assert api.get(f"{base}/index.json", headers=ALICE).status_code == 200
+
+
+def test_a_link_naming_an_id_with_a_trailing_newline_is_404(api, alpha, db, tmp_path) -> None:
+    db.insert_export(NEWLINE_ID, "alpha", "alice", None)
+    db.update_export(NEWLINE_ID, status="ready")
+    files = tmp_path / "exports" / "alpha" / NEWLINE_ID
+    files.mkdir(parents=True)
+    (files / "world.zip").write_bytes(b"PK")
+    token = api.app.state.exports.sign("alpha", NEWLINE_ID, int(time.time()) + 60)
+    assert api.get(f"/api/v1/export-downloads/{token}").status_code == 404
+
+
 def test_no_link_until_ready(api, alpha) -> None:
     export_id = start(api).json()["id"]
     resp = api.post(f"/api/v1/servers/alpha/exports/{export_id}/link", headers=ALICE)
