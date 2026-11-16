@@ -683,6 +683,15 @@ def test_a_symlink_is_refused(tmp_path) -> None:
     assert not (tmp_path / "out" / "thumb.webp").exists()
 
 
+@pytest.mark.parametrize("payload", [b"not a tar", b""])
+def test_an_unreadable_archive_is_refused(tmp_path, payload) -> None:
+    archive = tmp_path / "t.tgz"
+    archive.write_bytes(payload)
+    with pytest.raises(UnsafeArchive, match="could not be read"):
+        extract_thumbnail(archive, tmp_path / "out")
+    assert list((tmp_path / "out").iterdir()) == []
+
+
 # --- dsh-world-export --thumbnail, with stand-in tools ------------------------------------
 
 SCRIPT = Path(__file__).resolve().parents[1] / "export" / "dsh_world_export.py"
