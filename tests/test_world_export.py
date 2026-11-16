@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from dsh_api import export_pod
 from dsh_api.auth import FakeValidator
 from dsh_api.cluster import (
     ClusterError,
@@ -974,6 +975,43 @@ def test_links_and_too_many_members_are_refused(tmp_path) -> None:
         extract_export(archive, tmp_path / "out3")
 
 
+def directory(name: str):
+    def add(tar):
+        info = tarfile.TarInfo(name)
+        info.type = tarfile.DIRTYPE
+        tar.addfile(info)
+
+    return add
+
+
+@pytest.mark.parametrize("name", ["preview", "./preview"])
+def test_the_preview_directory_entry_is_passed_over(tmp_path, name) -> None:
+    archive = tmp_path / "a.tgz"
+    archive.write_bytes(make_tar(GOOD, extra=directory(name)))
+    written = extract_export(archive, tmp_path / "out")
+    assert sorted(written) == sorted(GOOD)
+    assert (tmp_path / "out" / "preview" / "index.json").read_bytes() == b"{}"
+
+
+@pytest.mark.parametrize("name", ["playerdata", "preview/sub"])
+def test_any_other_directory_entry_is_refused(tmp_path, name) -> None:
+    archive = tmp_path / "a.tgz"
+    archive.write_bytes(make_tar(GOOD, extra=directory(name)))
+    with pytest.raises(UnsafeArchive, match="unexpected entry"):
+        extract_export(archive, tmp_path / "out")
+    assert not (tmp_path / "out" / name).exists()
+
+
+def test_an_export_over_the_size_budget_is_refused_before_writing(tmp_path, monkeypatch):
+    monkeypatch.setattr(export_pod, "MAX_UNPACKED_BYTES", 4)
+    archive = tmp_path / "a.tgz"
+    archive.write_bytes(make_tar({"world.zip": b"PK", "summary.json": b"{}x"}))
+    with pytest.raises(UnsafeArchive, match="larger than allowed"):
+        extract_export(archive, tmp_path / "out")
+    assert (tmp_path / "out" / "world.zip").exists()
+    assert not (tmp_path / "out" / "summary.json").exists()
+
+
 def test_stream_command_passes_stdout_and_stderr_lines(tmp_path) -> None:
     lines: list[str] = []
     code, tail = stream_command(
@@ -984,6 +1022,21 @@ def test_stream_command_passes_stdout_and_stderr_lines(tmp_path) -> None:
     )
     assert code == 3 and lines == ["phase=copying", "error: nope"] and tail == lines
     assert (tmp_path / "out").read_bytes() == b"payload"
+
+
+def test_stream_command_skips_blank_stderr_lines(tmp_path) -> None:
+    lines: list[str] = []
+    script = "echo >&2; echo phase=copying >&2; echo '   ' >&2; echo error: nope >&2"
+    code, tail = stream_command(["sh", "-c", script], tmp_path / "out", lines.append, timeout=10)
+    assert code == 0 and lines == ["phase=copying", "error: nope"] and tail == lines
+
+
+def test_stream_command_keeps_only_the_last_20_stderr_lines(tmp_path) -> None:
+    lines: list[str] = []
+    script = "i=1; while [ $i -le 25 ]; do echo line$i >&2; i=$((i+1)); done"
+    code, tail = stream_command(["sh", "-c", script], tmp_path / "out", lines.append, timeout=10)
+    expected = [f"line{i}" for i in range(6, 26)]
+    assert code == 0 and len(lines) == 25 and tail == expected
 
 
 def test_stream_command_kills_on_timeout(tmp_path) -> None:
