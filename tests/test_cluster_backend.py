@@ -696,6 +696,21 @@ def test_reader_pod_is_deleted_when_it_never_becomes_ready(tmp_path):
     assert list((tmp_path / "b").iterdir()) == []
 
 
+def test_backup_survives_a_reader_pod_that_will_not_be_deleted(tmp_path):
+    """The tarball is already written; a pod left behind is a leak, not a failed backup."""
+    runner = Runner(
+        "persistentvolumeclaim/alpha-omcsi-mcserver\n",
+        "pod created\n",
+        "condition met\n",
+        "tarball-bytes",
+        ClusterError("the server is currently unable to handle the request"),
+    )
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path / "b"), run=runner)
+    path = be.backup_world("alpha", awake=False)
+    assert path.read_bytes() == b"tarball-bytes"
+    assert [c[0][3] for c in runner.calls] == ["get", "run", "wait", "exec", "delete"]
+
+
 def test_backup_of_a_server_without_a_world_volume_fails_fast(tmp_path):
     """A create that failed before helm ran has no PVC; nothing is started for it."""
     runner = Runner(ClusterError('persistentvolumeclaims "alpha-omcsi-mcserver" not found'))
@@ -789,6 +804,88 @@ def test_handshake_packet_shape():
     handshake_body += struct.pack(">H", port) + _varint(1)
     assert data.startswith(_varint(len(handshake_body)) + handshake_body)
     assert data.endswith(_varint(1) + _varint(0))  # the status request packet
+
+
+# The protocol's own VarInt examples. Every value the handshake above encodes
+# is under 128, so without these the multi-byte half of the codec ran nowhere,
+# and the test-local ``_varint`` could not catch it drifting.
+VARINT_VECTORS = [
+    (0, b"\x00"),
+    (1, b"\x01"),
+    (127, b"\x7f"),
+    (128, b"\x80\x01"),
+    (255, b"\xff\x01"),
+    (25565, b"\xdd\xc7\x01"),
+    (2097151, b"\xff\xff\x7f"),
+    (2147483647, b"\xff\xff\xff\xff\x07"),
+]
+
+
+@pytest.mark.parametrize(("value", "encoded"), VARINT_VECTORS)
+def test_varint_encodes_and_reads_back_the_protocol_examples(value, encoded):
+    import dsh_api.cluster as cluster
+
+    assert cluster._varint(value) == encoded
+    reader, writer = socket.socketpair()
+    with reader, writer:
+        writer.sendall(encoded + b"\x2a")  # a trailing byte that belongs to the next field
+        assert cluster._read_varint(reader) == value
+        assert reader.recv(1) == b"\x2a"  # exactly the varint was consumed
+
+
+def raw_minecraft_server(reply: bytes):
+    """A loopback socket that answers the handshake with ``reply`` and closes."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+
+    def serve():
+        conn, _ = srv.accept()
+        with conn:
+            conn.settimeout(2)
+            conn.recv(4096)
+            conn.sendall(reply)
+
+    threading.Thread(target=serve, daemon=True).start()
+    return srv.getsockname()[1]
+
+
+def test_server_list_ping_reads_a_status_longer_than_one_varint_byte():
+    """A real status (MOTD, sample players, favicon) runs past 127 bytes, so its
+    length prefixes take two varint bytes."""
+    status = {"players": {"online": 4, "max": 20}, "description": "x" * 300}
+    port = fake_minecraft_server(status)
+    assert server_list_ping("127.0.0.1", port, timeout=2) == status
+
+
+def test_server_list_ping_refuses_a_varint_that_never_ends():
+    port = raw_minecraft_server(b"\x80" * 7)
+    with pytest.raises(ValueError, match="varint too long"):
+        server_list_ping("127.0.0.1", port, timeout=2)
+
+
+def test_server_list_ping_on_a_status_cut_short_is_a_value_error():
+    """The server promised 100 bytes and hung up after a few: what arrived is
+    parsed as-is and is not JSON."""
+    partial = b'{"players": {'
+    body = _varint(0x00) + _varint(100) + partial
+    port = raw_minecraft_server(_varint(len(body) + 100) + body)
+    with pytest.raises(ValueError):
+        server_list_ping("127.0.0.1", port, timeout=2)
+
+
+def test_players_online_is_none_when_the_status_is_garbled(tmp_path, monkeypatch):
+    import dsh_api.cluster as cluster
+
+    port = raw_minecraft_server(b"\x80" * 7)
+    real_ping = cluster.server_list_ping
+
+    def ping_loopback(host, port_=25565, timeout=2.0):
+        return real_ping("127.0.0.1", port, timeout=2)
+
+    monkeypatch.setattr(cluster, "server_list_ping", ping_loopback)
+    be = KubectlHelmBackend("/opt/omcsi", str(tmp_path), run=Runner())
+    assert be.players_online("alpha") is None
 
 
 def test_players_online_is_none_when_the_server_cannot_be_asked(tmp_path, monkeypatch):
@@ -903,5 +1000,30 @@ def test_http_json_sends_a_text_body():
         url = f"http://127.0.0.1:{srv.server_port}/api/server/command"
         assert http_json(url, method="POST", body="say hi") == (200, None)
         assert received == [("text/plain", "say hi")]
+    finally:
+        srv.shutdown()
+
+
+def test_http_json_keeps_the_status_of_a_body_that_is_not_json():
+    """A proxy's HTML error page still says how the request went; only its
+    body is dropped."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            payload = b"<html>502 Bad Gateway</html>"
+            self.send_response(502)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{srv.server_port}/api/server/status"
+        assert http_json(url) == (502, None)
     finally:
         srv.shutdown()
